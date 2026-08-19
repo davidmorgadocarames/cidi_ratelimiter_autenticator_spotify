@@ -17,13 +17,15 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fase 0 completada** — scaffolding del proyecto. Ver el roadmap completo abajo y el detalle
-de qué está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
+🚧 **Fases 0 y 1 completadas** — scaffolding del proyecto, y API base con autenticación JWT
+(registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
+Postgres real. Ver el roadmap completo abajo y el detalle de qué está implementado vs pendiente en
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Stack técnico (previsto)
 
 - **Backend**: Python 3 + FastAPI
-- **Base de datos**: PostgreSQL (SQLAlchemy/SQLModel)
+- **Base de datos**: PostgreSQL (SQLAlchemy 2.0)
 - **Cache / Rate limiting**: Redis
 - **Búsqueda**: Meilisearch
 - **Cola de tareas en background**: Celery + Redis
@@ -56,7 +58,7 @@ de qué está implementado vs pendiente en [`docs/architecture.md`](docs/archite
 
 Requiere Python 3.13 (única versión verificada en este entorno; la CI de la Fase 5 se ejecutará
 además sobre 3.10/3.11/3.12 — ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos)
-para el riesgo de desalineación de versiones).
+para el riesgo de desalineación de versiones) y Docker (para Postgres, adelantado a la Fase 1).
 
 ```bash
 python -m venv .venv
@@ -68,8 +70,23 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copia `.env.example` a `.env` y completa los valores según la fase en la que estés trabajando
-(no todas las variables son necesarias desde el principio).
+Copia `.env.example` a `.env` y completa los valores. Desde la Fase 1 son obligatorias:
+`DATABASE_URL`, `TEST_DATABASE_URL`, `JWT_SECRET_KEY` (la app rechaza arrancar con el valor
+placeholder `change-me` — genera uno real con `openssl rand -hex 32`) y `COOKIE_SECURE` (`false`
+en desarrollo local sin HTTPS). El resto de variables se van sumando fase a fase.
+
+Levantar Postgres y aplicar las migraciones antes de correr la API o los tests:
+
+```bash
+docker compose up -d postgres
+alembic upgrade head
+uvicorn app.main:app --reload
+# en otra terminal
+pytest tests/ -v
+```
+
+Los tests corren contra una base de datos Postgres real y separada (`spotify_clone_test`, creada
+automáticamente por `docker/postgres-init/`), no contra SQLite ni con mocks.
 
 ## Decisiones de diseño
 

@@ -1,10 +1,27 @@
-# Fase 0: esqueleto vacío intencionalmente.
-# Los servicios reales se añaden progresivamente:
-#   - redis                  -> Fase 6 (standalone, para el rate limiter)
-#   - postgres + resto stack -> Fase 7 (contenedores completos + healthchecks)
-#   - minio                  -> Fase 8
-#   - meilisearch             -> Fase 10
-# Cada servicio se documentará en docs/architecture.md al añadirse.
+# Servicios adelantados fase a fase (ver docs/architecture.md):
+#   - postgres                -> Fase 1 (adelantado; el resto del stack completo es Fase 7)
+#   - redis                   -> Fase 6 (standalone, para el rate limiter)
+#   - minio                   -> Fase 8
+#   - meilisearch              -> Fase 10
 # (Sin clave `version:` - está deprecada en Compose v2.)
 
-services: {}
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: spotify_clone
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d spotify_clone"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
