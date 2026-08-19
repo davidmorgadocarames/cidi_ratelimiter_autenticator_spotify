@@ -127,9 +127,10 @@ sequenceDiagram
 
 ## Desarrollo local
 
-Requiere Python 3.13 (única versión verificada en este entorno; la CI de la Fase 5 se ejecutará
-además sobre 3.10/3.11/3.12 — ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos)
-para el riesgo de desalineación de versiones) y Docker (para Postgres, adelantado a la Fase 1).
+Requiere Python 3.13 en local (única versión instalada en esta máquina). El CI (Fase 5) corre
+además la suite completa contra 3.10/3.11/3.12 en GitHub Actions — verificado en verde en las
+tres, ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos). Requiere también
+Docker (para Postgres, adelantado a la Fase 1).
 
 ```bash
 python -m venv .venv

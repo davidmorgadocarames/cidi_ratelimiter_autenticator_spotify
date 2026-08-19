@@ -121,7 +121,7 @@ proyecto de portfolio).
 | 2    | UI de login y toggle de premium           | ✅ Implementado |
 | 3    | 2FA (TOTP)                                | ✅ Implementado |
 | 4    | Calidad de código local                   | ✅ Implementado |
-| 5    | CI                                        | ⬜ Pendiente    |
+| 5    | CI                                        | ✅ Implementado |
 | 6    | Rate limiter con Redis                    | ⬜ Pendiente    |
 | 7    | Contenedores                              | ⬜ Pendiente    |
 | 8    | Subida y transcodificación de audio       | ⬜ Pendiente    |
@@ -275,10 +275,12 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 
 ## Riesgos conocidos
 
-- **Desalineación de versión de Python**: el entorno de desarrollo local usa Python 3.13 (única
-  versión instalada en esta máquina), mientras que la matriz de CI planificada para la Fase 5 es
-  3.10/3.11/3.12. Es posible que aparezcan diferencias de comportamiento entre local y CI; se
-  revisará si surge algún problema concreto de compatibilidad.
+- ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
+  entorno de desarrollo local usa Python 3.13 (única versión instalada en esta máquina); la
+  matriz de CI (Fase 5) corre 3.10/3.11/3.12 de verdad en GitHub Actions. Las tres versiones
+  pasaron limpio en el primer PR real (migraciones, ruff, black, mypy `--strict`, pytest con
+  `--cov-fail-under=85`) — el riesgo que se venía documentando desde la Fase 0 como teórico quedó
+  descartado con datos reales, no solo asumido.
 - **Dependencias transitivas sin pinnear**: `requirements.txt` fija fastapi/uvicorn/pytest, pero
   no sus dependencias transitivas (pydantic, starlette, etc.). Local (3.13) y CI (3.10-3.12)
   podrían resolver versiones transitivas distintas — es el punto más probable donde el desfase de
