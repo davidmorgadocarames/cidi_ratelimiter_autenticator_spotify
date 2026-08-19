@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
+import pyotp
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.config import settings
 
@@ -43,3 +45,38 @@ def generate_refresh_token() -> str:
 
 def hash_refresh_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+class TOTPDecryptionError(Exception):
+    """El secreto TOTP no se pudo descifrar (TOTP_ENCRYPTION_KEY rotada o dato corrupto)."""
+
+
+def generate_totp_secret() -> str:
+    return pyotp.random_base32()
+
+
+def _totp_fernet() -> Fernet:
+    return Fernet(settings.totp_encryption_key.encode("utf-8"))
+
+
+def encrypt_totp_secret(secret: str) -> str:
+    return _totp_fernet().encrypt(secret.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_totp_secret(encrypted_secret: str) -> str:
+    try:
+        return _totp_fernet().decrypt(encrypted_secret.encode("utf-8")).decode("utf-8")
+    except (InvalidToken, ValueError) as exc:
+        # InvalidToken: clave rotada o payload cifrado pero corrupto/manipulado.
+        # ValueError (ej. binascii.Error): ni siquiera es base64 urlsafe válido -
+        # Fernet.decrypt lo intenta decodificar antes de validar el token.
+        raise TOTPDecryptionError(
+            "No se pudo descifrar el secreto TOTP (clave rotada o dato corrupto)."
+        ) from exc
+
+
+def verify_totp_code(secret: str, code: str, valid_window: int = 1) -> bool:
+    # valid_window=1 => tolera hasta 1 paso de 30s antes/después (±30s) por
+    # desfase de reloj entre servidor y dispositivo. pyotp compara con
+    # hmac.compare_digest internamente (resistente a timing attacks).
+    return pyotp.TOTP(secret).verify(code, valid_window=valid_window)

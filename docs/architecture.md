@@ -22,12 +22,12 @@ race condition de dos refresh simultáneos con el mismo token.
 
 **Fase 2 — UI mínima + toggle de premium.** UI servida como estáticos en `/`
 (`app/static/index.html`, `app.js`, `style.css`): tres vistas (cargando, auth con login+registro,
-dashboard) en una sola página, sin framework ni build tooling. Nuevo endpoint
-`PATCH /users/me/premium` (`app/api/users.py`), protegido con la misma dependencia
-`get_current_user` de Fase 1, body explícito `{"is_premium": bool}` (schema `PremiumUpdate`).
-Nueva columna `is_premium` en `User` (migración `e43601f7d62c`). 8 tests nuevos
-(`tests/test_users.py`, `tests/test_main.py`) — incluyen rechazo de payload inválido (422) y una
-regresión que verifica que el mount de estáticos en `/` no tapa las rutas de `/auth/*` ni `/health`.
+dashboard) en una sola página, sin framework ni build tooling. Endpoint de toggle de premium en
+`app/api/users.py`, protegido con la misma dependencia `get_current_user` de Fase 1 (en Fase 3 se
+reemplaza por `activate`/`deactivate`, ver abajo). Nueva columna `is_premium` en `User`
+(migración `e43601f7d62c`). 8 tests nuevos (`tests/test_users.py`, `tests/test_main.py`) —
+incluyen rechazo de payload inválido (422) y una regresión que verifica que el mount de estáticos
+en `/` no tapa las rutas de `/auth/*` ni `/health`.
 
 Verificación manual en navegador real (no solo tests): flujo completo conducido con Playwright
 headless + capturas de pantalla — primera visita sin parpadeo, registro con auto-login, toggle de
@@ -36,6 +36,31 @@ y el estado premium, logout, error de credenciales incorrectas, error de email d
 link a login. Esta verificación encontró y permitió corregir un bug real que los tests
 automatizados no habían cubierto: el botón de toggle mostraba el label equivocado tras un cambio
 exitoso (ver `withLoading` en `app/static/app.js`).
+
+**Fase 3 — 2FA (TOTP).** Nuevo router `app/api/totp.py` (`POST /2fa/setup`, `POST /2fa/verify`):
+secreto generado con pyotp, cifrado con Fernet y guardado en `User.totp_secret_encrypted`;
+confirmación con un código válido marca `totp_confirmed_at`. `PATCH /users/me/premium` de Fase 2
+se **reemplaza** por `POST /users/me/premium/activate` (contraseña + código TOTP, exige 2FA ya
+confirmado) y `POST /users/me/premium/deactivate` (simple, como antes) en `app/api/users.py`.
+Lockout ad-hoc en Postgres (5 intentos fallidos → 15 min de bloqueo, columnas
+`totp_failed_attempts`/`totp_locked_until`), compartido entre ambos endpoints que verifican un
+código, protegido con `SELECT ... FOR UPDATE` (`lock_user_for_totp_check`) — sin esto, intentos
+concurrentes pierden incrementos del contador y neutralizan el lockout, mismo patrón que la race
+condition de refresh tokens en Fase 1. 21 tests nuevos (`tests/test_totp.py`,
+`tests/test_users.py` reescrito) — código válido, incorrecto, dentro/fuera de la ventana de
+tolerancia (con `counter_offset` de pyotp para que el borde del step sea determinista, no
+segundos de reloj), doble setup (409), fallo controlado de descifrado, y una prueba de
+concurrencia real (5 hilos, mismo token) que confirma que el lockout no se puede saltear.
+
+Verificación manual: flujo completo con `curl` generando códigos reales vía pyotp, y en navegador
+real con Playwright. Esa verificación encontró y corrigió un bug real de CSS: una clase
+`.field-stack { display: flex }` tenía la misma especificidad que la regla `[hidden]` del
+navegador y ganaba por ser CSS de autor, dejando visibles secciones de la UI que debían estar
+ocultas (arreglado con `.field-stack:not([hidden])`). La ronda de revisión posterior encontró
+además que la primera versión del fix de concurrencia (`SELECT ... FOR UPDATE` sin
+`populate_existing=True`) bloqueaba la fila en Postgres correctamente pero SQLAlchemy seguía
+devolviendo el objeto Python ya cacheado en el identity map de la sesión (con el contador
+desactualizado) — el test de concurrencia lo detectó de inmediato.
 
 ## Diagrama de arquitectura
 
@@ -52,7 +77,7 @@ proyecto de portfolio).
 | 0    | Scaffolding del proyecto                  | ✅ Implementado |
 | 1    | API base y autenticación (JWT)            | ✅ Implementado |
 | 2    | UI de login y toggle de premium           | ✅ Implementado |
-| 3    | 2FA (TOTP)                                | ⬜ Pendiente    |
+| 3    | 2FA (TOTP)                                | ✅ Implementado |
 | 4    | Calidad de código local                   | ⬜ Pendiente    |
 | 5    | CI                                        | ⬜ Pendiente    |
 | 6    | Rate limiter con Redis                    | ⬜ Pendiente    |
@@ -131,6 +156,36 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   `fetch`/`XMLHttpRequest` para capturar el header `Authorization` en la próxima llamada real. No
   se presenta como mitigación de XSS, solo de robo pasivo de credenciales en reposo.
 
+**Fase 3 — 2FA (TOTP)**
+
+- **pyotp, no implementación manual del algoritmo**: aunque el enunciado permitía cualquiera de
+  las dos, pyotp usa `hmac.compare_digest` internamente (verificado leyendo su código fuente, no
+  asumido) — comparación en tiempo constante, resistente a timing attacks, algo fácil de hacer
+  mal en una implementación propia de código de seguridad.
+- **Fernet (`cryptography`) para cifrar el secreto TOTP en reposo**: cifrado simétrico
+  autenticado. `TOTP_ENCRYPTION_KEY` se valida al arranque con el mismo patrón que
+  `JWT_SECRET_KEY` — rechaza el placeholder `change-me` y además valida que sea una key Fernet
+  bien formada, para fallar rápido en vez de reventar en el primer login con 2FA.
+- **Ventana de tolerancia `valid_window=1` (±30s)**: por posible desfase de reloj entre servidor
+  y dispositivo, tal como pide el enunciado.
+- **Lockout ad-hoc en Postgres (5 intentos fallidos → 15 min de bloqueo), implementado ya en esta
+  fase, no pospuesto a Fase 6**: un código de 6 dígitos es un espacio de búsqueda pequeño y fijo
+  (10^6, ampliado a 3 códigos válidos simultáneos por la ventana de tolerancia) — sin límite es
+  fuerza bruta realmente explotable, no un riesgo teórico (así lo señaló la revisión de seguridad
+  del plan antes de implementar). Compartido entre `/2fa/verify` y la verificación TOTP de
+  `/users/me/premium/activate` — es la misma prueba de posesión del dispositivo. Protegido con
+  `SELECT ... FOR UPDATE` + `populate_existing=True` para que sea correcto bajo concurrencia real
+  (ver detalle en el Resumen de esta fase).
+- **`POST /2fa/setup` exige contraseña**, no solo un access token válido: por simetría con
+  `/premium/activate`, y porque sin esto un access token robado (30 min, riesgo ya documentado en
+  Fase 1) permitiría configurar 2FA sobre la cuenta de la víctima sin conocer su contraseña.
+- **Reemplazo de `PATCH /users/me/premium` (Fase 2) por `activate`/`deactivate` explícitos**: un
+  solo endpoint con requisitos distintos según la dirección del cambio (activar exige
+  password+TOTP, desactivar no exige nada extra) es peor diseño que dos endpoints explícitos.
+- **Activar premium exige 2FA ya confirmado** (403 si no): la protección contraseña+TOTP no tiene
+  sentido si el usuario nunca configuró el segundo factor: se le pide configurarlo primero en vez
+  de permitir una activación "más débil" sin él.
+
 ## Riesgos conocidos
 
 - **Desalineación de versión de Python**: el entorno de desarrollo local usa Python 3.13 (única
@@ -152,10 +207,18 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **`COOKIE_SECURE=true` por defecto requiere HTTPS**: en desarrollo local por `http://` hay que
   poner `COOKIE_SECURE=false` en `.env` (así está configurado en el `.env` local), o el navegador
   no enviará la cookie del refresh token.
-- **`PATCH /users/me/premium` solo exige un access token válido** (sin contraseña ni TOTP): con
-  un access token robado (válido hasta 30 min) se puede activar/desactivar premium sin fricción
-  adicional. Aceptado como limitación conocida para la Fase 2; la Fase 3 añade contraseña + TOTP
-  específicamente para la activación, sobre este mismo endpoint.
+- ~~`PATCH /users/me/premium` solo exige un access token válido~~ — **resuelto en Fase 3**:
+  `POST /users/me/premium/activate` ahora exige 2FA confirmado + contraseña + código TOTP.
+- **Pérdida o rotación de `TOTP_ENCRYPTION_KEY`**: deja indescifrables todos los secretos TOTP ya
+  guardados, forzando a reconfigurar 2FA a todos los usuarios existentes. No hay estrategia de
+  rotación de clave en esta fase (aceptado para el alcance de un portfolio).
+- **El lockout de TOTP es ad-hoc y por-usuario, no un rate limiter general**: protege contra
+  fuerza bruta contra UNA cuenta, pero no contra un atacante que reparta intentos entre muchas
+  cuentas distintas a la vez — eso sí necesita el rate limiter real de Fase 6 (Redis).
+- **No hay endpoint para desactivar 2FA una vez confirmado**: limitación conocida, fuera de
+  alcance de esta fase (no lo pedía el enunciado). Un usuario que pierde su dispositivo
+  autenticador no tiene forma de recuperar acceso a la activación de premium sin intervención
+  manual en la base de datos.
 
 ## Cómo escalaría esto en producción real
 

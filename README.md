@@ -17,11 +17,12 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0, 1 y 2 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-3 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
-Postgres real, y una UI mínima integrada (registro, login, dashboard con toggle de premium)
-servida por la propia API. Ver el roadmap completo abajo y el detalle de qué está implementado vs
-pendiente en [`docs/architecture.md`](docs/architecture.md).
+Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API, y
+autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium. Ver el
+roadmap completo abajo y el detalle de qué está implementado vs pendiente en
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
@@ -36,12 +37,57 @@ solo necesita ser suficiente para probar el login, el registro y el toggle de pr
 desde un navegador, no ser vistosa.
 
 Uso: con la API corriendo, abre `http://localhost:8000/` — permite registrarte o iniciar sesión,
-y desde el dashboard ver tu email, tu estado de premium y activarlo/desactivarlo (llama de verdad
-a `PATCH /users/me/premium`, protegido con el access token, no es un cambio solo visual). El
-access token vive únicamente en una variable JS en memoria (no en `localStorage`, ver
-[`docs/architecture.md`](docs/architecture.md) para el matiz de qué protege esto y qué no) — se
-pierde al recargar la página, pero un "silent refresh" (`POST /auth/refresh` vía la cookie
-`httpOnly`) recupera la sesión automáticamente sin pedir credenciales de nuevo.
+configurar 2FA (QR + confirmación) y, desde el dashboard, ver tu email, tu estado de premium y
+activarlo/desactivarlo. Activar premium llama de verdad a
+`POST /users/me/premium/activate` con contraseña + código TOTP (ver sección "Flujo de 2FA" abajo)
+— no es un cambio solo visual; desactivar sigue siendo `POST /users/me/premium/deactivate`, sin
+esa fricción extra. El access token vive únicamente en una variable JS en memoria (no en
+`localStorage`, ver [`docs/architecture.md`](docs/architecture.md) para el matiz de qué protege
+esto y qué no) — se pierde al recargar la página, pero un "silent refresh"
+(`POST /auth/refresh` vía la cookie `httpOnly`) recupera la sesión automáticamente sin pedir
+credenciales de nuevo.
+
+## Flujo de 2FA y activación de premium
+
+El código de 6 dígitos se calcula con [pyotp](https://github.com/pyauth/pyotp) (RFC 6238: HMAC-SHA1
+sobre un contador de pasos de 30s, truncado dinámicamente a 6 dígitos), con una ventana de
+tolerancia de ±1 paso (±30s) por posible desfase de reloj entre servidor y dispositivo. El secreto
+se guarda cifrado en Postgres (Fernet) y nunca se vuelve a mostrar en claro tras el setup inicial.
+
+```mermaid
+sequenceDiagram
+    actor Usuario
+    participant Frontend
+    participant API
+    participant DB
+
+    Usuario->>Frontend: Login (email + password)
+    Frontend->>API: POST /auth/login
+    API->>DB: Verificar credenciales
+    API-->>Frontend: access_token + cookie refresh (httpOnly)
+
+    Usuario->>Frontend: Configurar 2FA
+    Frontend->>API: POST /2fa/setup (password)
+    API->>DB: Verificar password, guardar secreto cifrado (Fernet)
+    API-->>Frontend: QR + secreto (otpauth URI)
+    Frontend-->>Usuario: Mostrar QR
+
+    Usuario->>Frontend: Código de la app autenticadora
+    Frontend->>API: POST /2fa/verify (code)
+    API->>DB: Verificar código (±30s), marcar totp_confirmed_at
+    API-->>Frontend: 2FA activado
+
+    Usuario->>Frontend: Activar premium
+    Frontend->>API: POST /users/me/premium/activate (password + code)
+    alt 2FA no confirmado
+        API-->>Frontend: 403 Configura 2FA antes de activar premium
+    else 2FA confirmado
+        API->>DB: Verificar lockout, password, código TOTP
+        API->>DB: is_premium = true
+        API-->>Frontend: 200 Premium activado
+        Frontend-->>Usuario: "Premium activo"
+    end
+```
 
 ## Stack técnico (previsto)
 

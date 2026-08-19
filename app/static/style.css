@@ -13,7 +13,8 @@ h1 {
   font-size: 1.25rem;
 }
 
-form {
+form,
+.field-stack:not([hidden]) {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -58,6 +59,22 @@ button:disabled {
   font-size: 0.875rem;
 }
 
-#dashboard-view button#logout {
-  margin-left: 0.5rem;
+.hint {
+  font-size: 0.875rem;
+  opacity: 0.8;
+}
+
+section {
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid #d0d7de;
+}
+
+#totp-qr {
+  display: block;
+  margin: 0.5rem 0;
+}
+
+code {
+  font-size: 0.875rem;
 }

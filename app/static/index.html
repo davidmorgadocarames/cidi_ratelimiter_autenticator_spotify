@@ -50,9 +50,50 @@
   <main id="dashboard-view" hidden>
     <h1>CIDI Spotify Clone</h1>
     <p>Sesión iniciada como <strong id="dashboard-email"></strong></p>
-    <p>Premium: <strong id="premium-status" aria-live="polite">No</strong></p>
-    <p class="error" id="dashboard-error" role="alert" tabindex="-1" hidden></p>
-    <button type="button" id="toggle-premium">Activar premium</button>
+
+    <section id="security-section">
+      <h2>Seguridad</h2>
+      <p>2FA: <strong id="totp-status" aria-live="polite">No configurado</strong></p>
+
+      <div id="totp-setup-start" class="field-stack">
+        <p class="hint">Si ya tenías un código QR anterior sin confirmar, dejará de funcionar en
+          cuanto generes uno nuevo.</p>
+        <label for="totp-setup-password">Contraseña</label>
+        <input id="totp-setup-password" type="password" autocomplete="current-password">
+        <p class="error" id="totp-setup-error" role="alert" tabindex="-1" hidden></p>
+        <button type="button" id="totp-setup-button">Configurar 2FA</button>
+      </div>
+
+      <div id="totp-confirm-section" class="field-stack" hidden>
+        <img id="totp-qr" alt="Código QR para configurar la app autenticadora" width="200" height="200">
+        <p>O introduce este código manualmente en tu app autenticadora:</p>
+        <p><code id="totp-secret"></code></p>
+        <label for="totp-confirm-code">Código de 6 dígitos</label>
+        <input id="totp-confirm-code" type="text" inputmode="numeric" pattern="\d{6}" maxlength="6" autocomplete="one-time-code">
+        <p class="error" id="totp-confirm-error" role="alert" tabindex="-1" hidden></p>
+        <button type="button" id="totp-confirm-button">Confirmar</button>
+      </div>
+    </section>
+
+    <section id="premium-section">
+      <h2>Premium</h2>
+      <p>Premium: <strong id="premium-status" aria-live="polite">No</strong></p>
+      <p class="error" id="dashboard-error" role="alert" tabindex="-1" hidden></p>
+
+      <button type="button" id="toggle-premium">Activar premium</button>
+      <p id="premium-needs-2fa-hint" hidden>Configura 2FA para poder activar premium.</p>
+
+      <div id="premium-activate-form" class="field-stack" hidden>
+        <label for="premium-password">Contraseña</label>
+        <input id="premium-password" type="password" autocomplete="current-password">
+        <label for="premium-totp-code">Código TOTP</label>
+        <input id="premium-totp-code" type="text" inputmode="numeric" pattern="\d{6}" maxlength="6" autocomplete="one-time-code">
+        <p class="error" id="premium-activate-error" role="alert" tabindex="-1" hidden></p>
+        <button type="button" id="premium-activate-confirm">Confirmar activación</button>
+        <button type="button" id="premium-activate-cancel" class="link-button">Cancelar</button>
+      </div>
+    </section>
+
     <button type="button" id="logout">Cerrar sesión</button>
   </main>
 

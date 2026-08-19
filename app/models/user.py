@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import TIMESTAMP, Boolean, ForeignKey, String, func
+from sqlalchemy import TIMESTAMP, Boolean, ForeignKey, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.session import Base
@@ -17,6 +17,22 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # --- 2FA (TOTP) ---
+    # "Activado" (totp_enabled, ver abajo) exige AMBAS no-nulas: secreto guardado
+    # y confirmado con un código válido. Mientras solo hay secreto pero no
+    # confirmación, el 2FA está "pendiente" (setup a medias).
+    totp_secret_encrypted: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    totp_confirmed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    # Lockout ad-hoc de intentos de código TOTP (setup/verify y activación de
+    # premium comparten este contador: ambos son la misma prueba de posesión
+    # del dispositivo). Ver app/api/totp.py.
+    totp_failed_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    totp_locked_until: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+    @property
+    def totp_enabled(self) -> bool:
+        return self.totp_secret_encrypted is not None and self.totp_confirmed_at is not None
 
 
 class RefreshToken(Base):

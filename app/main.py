@@ -2,12 +2,14 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.auth import router as auth_router
+from app.api.totp import router as totp_router
 from app.api.users import router as users_router
 
 app = FastAPI(title="CIDI Spotify Clone API")
 
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(totp_router)
 
 
 @app.get("/health")

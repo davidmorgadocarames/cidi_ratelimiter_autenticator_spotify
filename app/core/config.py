@@ -1,3 +1,4 @@
+from cryptography.fernet import Fernet
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
 
     cookie_secure: bool = True
 
+    totp_encryption_key: str = "change-me"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:
@@ -23,6 +26,25 @@ class Settings(BaseSettings):
                 "JWT_SECRET_KEY sigue en el valor placeholder 'change-me'. "
                 "Genera uno real (ej. `openssl rand -hex 32`) y ponlo en .env."
             )
+        return value
+
+    @field_validator("totp_encryption_key")
+    @classmethod
+    def _validate_totp_encryption_key(cls, value: str) -> str:
+        if value == "change-me":
+            raise ValueError(
+                "TOTP_ENCRYPTION_KEY sigue en el valor placeholder 'change-me'. "
+                "Genera uno real con "
+                "`python -c \"from cryptography.fernet import Fernet; "
+                'print(Fernet.generate_key().decode())"` y ponlo en .env.'
+            )
+        try:
+            Fernet(value.encode("utf-8"))
+        except Exception as exc:
+            raise ValueError(
+                "TOTP_ENCRYPTION_KEY no es una clave Fernet válida "
+                "(debe ser base64 urlsafe de 32 bytes)."
+            ) from exc
         return value
 
 

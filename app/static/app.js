@@ -27,9 +27,30 @@
   const showLoginBtn = document.getElementById("show-login");
 
   const dashboardEmail = document.getElementById("dashboard-email");
+
+  const totpStatus = document.getElementById("totp-status");
+  const totpSetupStart = document.getElementById("totp-setup-start");
+  const totpSetupPassword = document.getElementById("totp-setup-password");
+  const totpSetupError = document.getElementById("totp-setup-error");
+  const totpSetupButton = document.getElementById("totp-setup-button");
+  const totpConfirmSection = document.getElementById("totp-confirm-section");
+  const totpQr = document.getElementById("totp-qr");
+  const totpSecret = document.getElementById("totp-secret");
+  const totpConfirmCode = document.getElementById("totp-confirm-code");
+  const totpConfirmError = document.getElementById("totp-confirm-error");
+  const totpConfirmButton = document.getElementById("totp-confirm-button");
+
   const premiumStatus = document.getElementById("premium-status");
   const dashboardError = document.getElementById("dashboard-error");
   const togglePremiumBtn = document.getElementById("toggle-premium");
+  const premiumNeeds2faHint = document.getElementById("premium-needs-2fa-hint");
+  const premiumActivateForm = document.getElementById("premium-activate-form");
+  const premiumPassword = document.getElementById("premium-password");
+  const premiumTotpCode = document.getElementById("premium-totp-code");
+  const premiumActivateError = document.getElementById("premium-activate-error");
+  const premiumActivateConfirm = document.getElementById("premium-activate-confirm");
+  const premiumActivateCancel = document.getElementById("premium-activate-cancel");
+
   const logoutBtn = document.getElementById("logout");
 
   function showView(view) {
@@ -46,6 +67,19 @@
   function clearError(el) {
     el.textContent = "";
     el.hidden = true;
+  }
+
+  // FastAPI/Pydantic devuelve `detail` como string en errores "de negocio"
+  // (HTTPException) pero como una LISTA de objetos {loc, msg, type} en errores
+  // 422 de validación de body. Sin esto, `data.detail || fallback` asigna el
+  // array a textContent y el usuario ve literalmente "[object Object]".
+  function extractErrorMessage(data, fallback) {
+    const detail = data && data.detail;
+    if (typeof detail === "string" && detail.length > 0) return detail;
+    if (Array.isArray(detail) && detail.length > 0 && typeof detail[0]?.msg === "string") {
+      return detail[0].msg;
+    }
+    return fallback;
   }
 
   // button.dataset.loading marca explícitamente "este botón sigue mostrando su
@@ -69,19 +103,38 @@
     }
   }
 
+  function authFetch(url, options = {}) {
+    const headers = { ...(options.headers || {}), Authorization: `Bearer ${state.accessToken}` };
+    return fetch(url, { ...options, headers });
+  }
+
   function renderDashboard(user) {
     currentUser = user;
     dashboardEmail.textContent = user.email;
+
+    totpStatus.textContent = user.totp_enabled ? "Activado" : "No configurado";
+    totpSetupStart.hidden = user.totp_enabled;
+    totpConfirmSection.hidden = true;
+    clearError(totpSetupError);
+    clearError(totpConfirmError);
+    totpSetupPassword.value = "";
+    totpConfirmCode.value = "";
+
     premiumStatus.textContent = user.is_premium ? "Sí" : "No";
     togglePremiumBtn.textContent = user.is_premium ? "Desactivar premium" : "Activar premium";
     delete togglePremiumBtn.dataset.loading;
+    premiumNeeds2faHint.hidden = true;
+    premiumActivateForm.hidden = true;
+    premiumPassword.value = "";
+    premiumTotpCode.value = "";
+    clearError(premiumActivateError);
+    clearError(dashboardError);
+
     showView("dashboard");
   }
 
   async function fetchMe() {
-    const response = await fetch("/auth/me", {
-      headers: { Authorization: `Bearer ${state.accessToken}` },
-    });
+    const response = await authFetch("/auth/me");
     if (!response.ok) throw new Error("No se pudo obtener el usuario actual");
     return response.json();
   }
@@ -117,7 +170,7 @@
         });
         if (!response.ok) {
           const data = await response.json().catch(() => ({}));
-          showError(loginError, data.detail || "No se pudo iniciar sesión");
+          showError(loginError, extractErrorMessage(data, "No se pudo iniciar sesión"));
           loginPassword.focus();
           return;
         }
@@ -143,7 +196,7 @@
         });
         if (!response.ok) {
           const data = await response.json().catch(() => ({}));
-          showError(registerError, data.detail || "No se pudo crear la cuenta");
+          showError(registerError, extractErrorMessage(data, "No se pudo crear la cuenta"));
           registerEmail.focus();
           return;
         }
@@ -187,26 +240,115 @@
     loginEmail.focus();
   });
 
-  togglePremiumBtn.addEventListener("click", async () => {
-    clearError(dashboardError);
-    await withLoading(togglePremiumBtn, "Guardando…", async () => {
+  totpSetupButton.addEventListener("click", async () => {
+    clearError(totpSetupError);
+    await withLoading(totpSetupButton, "Configurando…", async () => {
       try {
-        const response = await fetch("/users/me/premium", {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${state.accessToken}`,
-          },
-          body: JSON.stringify({ is_premium: !currentUser.is_premium }),
+        const response = await authFetch("/2fa/setup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: totpSetupPassword.value }),
         });
         if (!response.ok) {
-          showError(dashboardError, "No se pudo actualizar el estado premium.");
+          const data = await response.json().catch(() => ({}));
+          showError(totpSetupError, extractErrorMessage(data, "No se pudo configurar 2FA"));
+          totpSetupPassword.focus();
+          return;
+        }
+        const data = await response.json();
+        totpQr.src = `data:image/png;base64,${data.qr_code_base64}`;
+        totpSecret.textContent = data.secret;
+        totpConfirmSection.hidden = false;
+        totpConfirmCode.focus();
+      } catch {
+        showError(totpSetupError, NETWORK_ERROR_MESSAGE);
+      }
+    });
+  });
+
+  totpConfirmButton.addEventListener("click", async () => {
+    clearError(totpConfirmError);
+    await withLoading(totpConfirmButton, "Confirmando…", async () => {
+      try {
+        const response = await authFetch("/2fa/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: totpConfirmCode.value }),
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          showError(totpConfirmError, extractErrorMessage(data, "No se pudo confirmar el código"));
+          totpConfirmCode.focus();
+          return;
+        }
+        const user = await fetchMe();
+        renderDashboard(user);
+      } catch {
+        showError(totpConfirmError, NETWORK_ERROR_MESSAGE);
+      }
+    });
+  });
+
+  togglePremiumBtn.addEventListener("click", async () => {
+    clearError(dashboardError);
+
+    if (currentUser.is_premium) {
+      await withLoading(togglePremiumBtn, "Guardando…", async () => {
+        try {
+          const response = await authFetch("/users/me/premium/deactivate", { method: "POST" });
+          if (!response.ok) {
+            showError(dashboardError, "No se pudo desactivar premium.");
+            return;
+          }
+          const user = await response.json();
+          renderDashboard(user);
+        } catch {
+          showError(dashboardError, NETWORK_ERROR_MESSAGE);
+        }
+      });
+      return;
+    }
+
+    if (!currentUser.totp_enabled) {
+      premiumNeeds2faHint.hidden = false;
+      premiumActivateForm.hidden = true;
+      return;
+    }
+
+    premiumNeeds2faHint.hidden = true;
+    premiumActivateForm.hidden = false;
+    premiumPassword.focus();
+  });
+
+  premiumActivateCancel.addEventListener("click", () => {
+    premiumActivateForm.hidden = true;
+    premiumPassword.value = "";
+    premiumTotpCode.value = "";
+    clearError(premiumActivateError);
+  });
+
+  premiumActivateConfirm.addEventListener("click", async () => {
+    clearError(premiumActivateError);
+    await withLoading(premiumActivateConfirm, "Activando…", async () => {
+      try {
+        const response = await authFetch("/users/me/premium/activate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            password: premiumPassword.value,
+            totp_code: premiumTotpCode.value,
+          }),
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          showError(premiumActivateError, extractErrorMessage(data, "No se pudo activar premium"));
+          premiumTotpCode.focus();
           return;
         }
         const user = await response.json();
         renderDashboard(user);
       } catch {
-        showError(dashboardError, NETWORK_ERROR_MESSAGE);
+        showError(premiumActivateError, NETWORK_ERROR_MESSAGE);
       }
     });
   });
@@ -223,7 +365,6 @@
       currentUser = null;
       loginForm.reset();
       registerForm.reset();
-      clearError(dashboardError);
       showView("auth");
     });
   });
