@@ -6,8 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    database_url: str = "postgresql+psycopg://user:password@localhost:5432/spotify_clone"
-    test_database_url: str = "postgresql+psycopg://user:password@localhost:5432/spotify_clone_test"
+    database_url: str = (
+        "postgresql+psycopg://user:password@localhost:5432/spotify_clone"
+    )
+    test_database_url: str = (
+        "postgresql+psycopg://user:password@localhost:5432/spotify_clone_test"
+    )
 
     jwt_secret_key: str = "change-me"
     jwt_algorithm: str = "HS256"
@@ -35,7 +39,7 @@ class Settings(BaseSettings):
             raise ValueError(
                 "TOTP_ENCRYPTION_KEY sigue en el valor placeholder 'change-me'. "
                 "Genera uno real con "
-                "`python -c \"from cryptography.fernet import Fernet; "
+                '`python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())"` y ponlo en .env.'
             )
         try:

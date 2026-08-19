@@ -17,10 +17,11 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-3 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-4 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
-Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API, y
-autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium. Ver el
+Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
+autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, y tooling de
+calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit). Ver el
 roadmap completo abajo y el detalle de qué está implementado vs pendiente en
 [`docs/architecture.md`](docs/architecture.md).
 
@@ -134,6 +135,11 @@ python -m venv .venv
 # Linux/Mac
 source .venv/bin/activate
 
+# Para desarrollo (ya incluye requirements.txt vía -r; añade pytest, httpx, pytest-cov,
+# ruff, black, mypy, pre-commit):
+pip install -r requirements-dev.txt
+# Si solo necesitas runtime (ej. lo que instalaría la imagen Docker de producción,
+# Fase 7), sin nada de lo anterior:
 pip install -r requirements.txt
 ```
 
@@ -154,6 +160,27 @@ pytest tests/ -v
 
 Los tests corren contra una base de datos Postgres real y separada (`spotify_clone_test`, creada
 automáticamente por `docker/postgres-init/`), no contra SQLite ni con mocks.
+
+## Calidad de código local
+
+Con `requirements-dev.txt` instalado:
+
+```bash
+ruff check .                              # linter
+black .                                   # formateador
+mypy app tests                            # chequeo de tipos (--strict)
+pytest tests/ --cov=app --cov-report=term-missing   # tests + cobertura
+```
+
+`pre-commit install` (una vez) activa un hook de git que corre automáticamente `ruff`, `black`,
+`mypy` y unos hooks de higiene básicos (espacios en blanco, fin de archivo, YAML válido) antes de
+cada commit. **pytest no está en este hook a propósito**: necesita Postgres corriendo en Docker,
+así que se deja para CI (Fase 5) y para correrlo manualmente. El hook de `mypy` es local
+(`language: system`, no el mirror oficial de pre-commit) porque resolver los tipos de
+FastAPI/SQLAlchemy/Pydantic correctamente requiere el entorno del proyecto instalado — esto
+significa que usa el `mypy` que encuentre en el `PATH` de quien commitea: **el venv debe estar
+activado** en la terminal donde se hace `git commit`, o el hook falla con
+`Executable 'mypy' not found`.
 
 ## Decisiones de diseño
 

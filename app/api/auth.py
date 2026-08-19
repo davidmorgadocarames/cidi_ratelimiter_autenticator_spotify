@@ -49,7 +49,9 @@ def _create_refresh_token_record(
     db: Session, user_id: int, family_id: str
 ) -> tuple[RefreshToken, str]:
     raw_token = generate_refresh_token()
-    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days)
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        days=settings.refresh_token_expire_days
+    )
     record = RefreshToken(
         user_id=user_id,
         family_id=family_id,
@@ -92,7 +94,9 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
     # try/except IntegrityError de abajo, que es la guarda real contra la carrera.
     existing = db.scalar(select(User).where(User.email == payload.email))
     if existing is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email ya registrado")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Email ya registrado"
+        )
 
     user = User(email=payload.email, hashed_password=hash_password(payload.password))
     db.add(user)
@@ -131,7 +135,9 @@ def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo"
+        )
 
     family_id = str(uuid.uuid4())
     _, raw_refresh_token = _create_refresh_token_record(db, user.id, family_id)
@@ -160,7 +166,9 @@ def refresh(
     # detectado" de abajo. Sin este lock, ambas leerían revoked_at IS NULL y
     # emitirían dos refresh tokens activos para la misma family_id.
     record = db.scalar(
-        select(RefreshToken).where(RefreshToken.token_hash == token_hash).with_for_update()
+        select(RefreshToken)
+        .where(RefreshToken.token_hash == token_hash)
+        .with_for_update()
     )
 
     if record is None:
@@ -169,7 +177,8 @@ def refresh(
         )
 
     if record.revoked_at is not None:
-        # Reuso de un token ya rotado: se asume robo y se revoca toda la cadena de sesión.
+        # Reuso de un token ya rotado: se asume robo y se revoca toda la cadena de
+        # sesión.
         now = datetime.now(timezone.utc)
         db.query(RefreshToken).filter(
             RefreshToken.family_id == record.family_id,
@@ -206,7 +215,9 @@ def logout(
 ) -> None:
     if refresh_token is not None:
         token_hash = hash_refresh_token(refresh_token)
-        record = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == token_hash))
+        record = db.scalar(
+            select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        )
         if record is not None and record.revoked_at is None:
             record.revoked_at = datetime.now(timezone.utc)
             db.commit()

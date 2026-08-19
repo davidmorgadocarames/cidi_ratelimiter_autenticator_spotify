@@ -1,0 +1,37 @@
+# pytest NO corre aquí a propósito: necesita Postgres en Docker corriendo, sería
+# frágil (falla si Docker no está arriba) y cada vez más lento. Queda para CI
+# (Fase 5) y para correrlo manualmente en desarrollo. Ver docs/architecture.md.
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy app tests
+        language: system
+        pass_filenames: false
+        # Hook local (no el mirror oficial de pre-commit): resolver los tipos de
+        # FastAPI/SQLAlchemy/Pydantic correctamente requiere el entorno real del
+        # proyecto instalado, no un venv aislado con additional_dependencies
+        # duplicadas a mano. Trade-off aceptado: usa el "mypy" del PATH de quien
+        # commitea (venv del proyecto activado), no uno gestionado por pre-commit —
+        # ver README.md.

@@ -1,0 +1,40 @@
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Patrón estándar/recomendado de FastAPI: Depends(...) como valor por defecto de un
+# parámetro, evaluado por FastAPI en cada request, no una única vez al definir la
+# función (que es lo que B008 previene en el caso general). Falso positivo conocido.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
+
+[tool.black]
+line-length = 88
+target-version = ["py310", "py311", "py312"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+exclude = ["app/db/migrations/versions/"]
+
+[[tool.mypy.overrides]]
+# pyotp ya viene tipado (no hace falta override); qrcode no publica stubs/py.typed.
+module = ["qrcode.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Sin esto, "pytest ..." (invocado directo, no como "python -m pytest") no
+# encuentra el paquete "app": python -m antepone el cwd a sys.path, pero el
+# ejecutable pytest por sí solo no lo hace.
+pythonpath = ["."]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/db/migrations/versions/*"]
+
+[tool.coverage.report]
+show_missing = true

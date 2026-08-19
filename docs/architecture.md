@@ -62,6 +62,27 @@ además que la primera versión del fix de concurrencia (`SELECT ... FOR UPDATE`
 devolviendo el objeto Python ya cacheado en el identity map de la sesión (con el contador
 desactualizado) — el test de concurrencia lo detectó de inmediato.
 
+**Fase 4 — Calidad de código local.** Config centralizada en `pyproject.toml` nuevo: ruff
+(`E`, `F`, `I`, `UP`, `B`, `SIM`, `C4`), black, mypy en modo `--strict` completo, pytest y
+coverage. `requirements-dev.txt` nuevo separa herramientas de desarrollo (pytest, httpx,
+pytest-cov, ruff, black, mypy, pre-commit) de `requirements.txt` (solo runtime). `.pre-commit-config.yaml`
+nuevo con hooks de higiene + ruff + black + mypy (hook local, no el mirror oficial — ver
+Decisiones técnicas).
+
+Corregir mypy `--strict` sobre las ~25 archivos ya escritos en Fases 1-3 fue, con diferencia, la
+parte que más trabajo dio: 61 errores en la primera corrida, la gran mayoría (`no-untyped-def`)
+en funciones de test sin `-> None` y fixtures de `conftest.py` sin tipar, más dos casos reales en
+`app/` (`decode_access_token` devolviendo `dict` sin parámetros genéricos; `decrypt_totp_secret`
+recibiendo un `str | None` sin narrowing en `app/api/users.py`, resuelto con un chequeo explícito
+sobre la fila ya bloqueada, no solo para satisfacer al type-checker). Cero uso de `# type: ignore`
+— no hizo falta ninguno (`pyotp`/`qrcode` resultaron tener anotaciones suficientes para mypy sin
+necesitar los overrides de `ignore_missing_imports` que se habían dejado preparados por si acaso).
+
+Cobertura real medida: **94%** (`pytest --cov=app`), sin umbral obligatorio todavía (ver
+Decisiones técnicas). Los huecos son en su mayoría ramas de error poco alcanzables en tests
+unitarios (`app/db/session.py` 69%, la construcción del engine/sesión en sí) y algunas líneas de
+`app/api/auth.py`/`app/core/config.py`.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -78,7 +99,7 @@ proyecto de portfolio).
 | 1    | API base y autenticación (JWT)            | ✅ Implementado |
 | 2    | UI de login y toggle de premium           | ✅ Implementado |
 | 3    | 2FA (TOTP)                                | ✅ Implementado |
-| 4    | Calidad de código local                   | ⬜ Pendiente    |
+| 4    | Calidad de código local                   | ✅ Implementado |
 | 5    | CI                                        | ⬜ Pendiente    |
 | 6    | Rate limiter con Redis                    | ⬜ Pendiente    |
 | 7    | Contenedores                              | ⬜ Pendiente    |
@@ -186,6 +207,27 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   sentido si el usuario nunca configuró el segundo factor: se le pide configurarlo primero en vez
   de permitir una activación "más débil" sin él.
 
+**Fase 4 — Calidad de código local**
+
+- **mypy en modo `--strict` completo**, no un subconjunto: decisión explícita del usuario,
+  asumiendo el coste de corregir el código ya escrito (ver Resumen) a cambio de mantener ese
+  rigor en las fases siguientes desde el primer commit de cada una, en vez de ir acumulando deuda
+  de tipado para corregir toda de golpe más adelante.
+- **`requirements-dev.txt` separado de `requirements.txt`**: las herramientas de Fase 4 (pytest,
+  ruff, black, mypy, pre-commit) son de desarrollo, no de runtime — relevante de cara a la Fase 7,
+  donde la imagen Docker de producción no necesita ninguna de ellas instalada.
+- **pytest fuera de pre-commit**: necesita Postgres corriendo en Docker; atarlo a cada commit
+  sería frágil (falla si Docker no está arriba) y cada vez más lento a medida que crece la suite.
+  Queda para CI (Fase 5) y para correrlo manualmente.
+- **`mypy` como hook local de pre-commit** (`language: system`) en vez del mirror oficial:
+  resolver los tipos de FastAPI/SQLAlchemy/Pydantic correctamente requiere el entorno real del
+  proyecto instalado. Trade-off aceptado: el hook depende de que el venv esté activado en la
+  terminal donde se commitea (documentado en el README), a cambio de no duplicar a mano la lista
+  de dependencias en `additional_dependencies`.
+- **`pytest-cov` sin `--cov-fail-under` todavía**: se mide la cobertura real (94%, ver Resumen)
+  antes de comprometerse a un umbral — fijar uno arbitrario sin conocer el número real podría
+  bloquear commits legítimos o quedar puesto artificialmente bajo. Se revisa en Fase 5.
+
 ## Riesgos conocidos
 
 - **Desalineación de versión de Python**: el entorno de desarrollo local usa Python 3.13 (única
@@ -219,6 +261,12 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   alcance de esta fase (no lo pedía el enunciado). Un usuario que pierde su dispositivo
   autenticador no tiene forma de recuperar acceso a la activación de premium sin intervención
   manual en la base de datos.
+- **El hook de `mypy` en pre-commit requiere el venv activado**: al ser `language: system`, usa
+  el `mypy` del `PATH` de quien commitea. Si el venv no está activado (otra terminal, GUI de git),
+  el hook falla con `Executable 'mypy' not found` en vez de correr una versión distinta en
+  silencio — falla ruidoso, no silencioso, pero sigue siendo fricción a documentar (ver README).
+- **`pytest-cov` sin umbral obligatorio**: nada impide bajar del 94% actual en una fase futura sin
+  que ningún check lo bloquee, hasta que se fije `--cov-fail-under` en Fase 5.
 
 ## Cómo escalaría esto en producción real
 

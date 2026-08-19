@@ -57,12 +57,19 @@ def lock_user_for_totp_check(db: Session, user_id: int) -> User:
 
 
 def check_totp_lockout(user: User) -> None:
-    if user.totp_locked_until is not None and user.totp_locked_until > datetime.now(timezone.utc):
-        remaining_seconds = (user.totp_locked_until - datetime.now(timezone.utc)).total_seconds()
+    if user.totp_locked_until is not None and user.totp_locked_until > datetime.now(
+        timezone.utc
+    ):
+        remaining_seconds = (
+            user.totp_locked_until - datetime.now(timezone.utc)
+        ).total_seconds()
         remaining_minutes = max(1, int(remaining_seconds // 60) + 1)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Demasiados intentos fallidos. Inténtalo de nuevo en {remaining_minutes} min.",
+            detail=(
+                "Demasiados intentos fallidos. "
+                f"Inténtalo de nuevo en {remaining_minutes} min."
+            ),
         )
 
 
@@ -129,7 +136,9 @@ def verify_totp(
     if locked_user.totp_secret_encrypted is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No hay una configuración de 2FA en curso. Llama primero a /2fa/setup.",
+            detail=(
+                "No hay una configuración de 2FA en curso. Llama primero a /2fa/setup."
+            ),
         )
 
     check_totp_lockout(locked_user)

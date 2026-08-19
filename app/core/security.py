@@ -1,6 +1,7 @@
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import bcrypt
 import jwt
@@ -32,11 +33,16 @@ def create_access_token(subject: str) -> str:
         "iat": now,
         "exp": now + timedelta(minutes=settings.access_token_expire_minutes),
     }
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return jwt.encode(
+        payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm
+    )
 
 
-def decode_access_token(token: str) -> dict:
-    return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+def decode_access_token(token: str) -> dict[str, Any]:
+    payload: dict[str, Any] = jwt.decode(
+        token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm]
+    )
+    return payload
 
 
 def generate_refresh_token() -> str:
@@ -48,7 +54,7 @@ def hash_refresh_token(token: str) -> str:
 
 
 class TOTPDecryptionError(Exception):
-    """El secreto TOTP no se pudo descifrar (TOTP_ENCRYPTION_KEY rotada o dato corrupto)."""
+    """No se pudo descifrar (TOTP_ENCRYPTION_KEY rotada o dato corrupto)."""
 
 
 def generate_totp_secret() -> str:

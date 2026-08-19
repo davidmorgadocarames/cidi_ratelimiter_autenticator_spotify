@@ -2,23 +2,27 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
+from httpx import Response
+from sqlalchemy.orm import Session
 
 from app.main import app
 from app.models.user import RefreshToken
 
 
-def _register(client: TestClient, email: str, password: str = "supersecret"):
+def _register(
+    client: TestClient, email: str, password: str = "supersecret"
+) -> Response:
     return client.post("/auth/register", json={"email": email, "password": password})
 
 
 def _register_and_login(
     client: TestClient, email: str = "login@example.com", password: str = "supersecret"
-):
+) -> Response:
     _register(client, email, password)
     return client.post("/auth/login", data={"username": email, "password": password})
 
 
-def test_register_success(client: TestClient):
+def test_register_success(client: TestClient) -> None:
     response = _register(client, "user@example.com")
     assert response.status_code == 201
     body = response.json()
@@ -26,13 +30,15 @@ def test_register_success(client: TestClient):
     assert "hashed_password" not in body
 
 
-def test_register_duplicate_email_rejected(client: TestClient):
+def test_register_duplicate_email_rejected(client: TestClient) -> None:
     _register(client, "dup@example.com")
     response = _register(client, "dup@example.com")
     assert response.status_code == 409
 
 
-def test_login_success_returns_access_token_and_refresh_cookie(client: TestClient):
+def test_login_success_returns_access_token_and_refresh_cookie(
+    client: TestClient,
+) -> None:
     response = _register_and_login(client)
     assert response.status_code == 200
     body = response.json()
@@ -41,35 +47,38 @@ def test_login_success_returns_access_token_and_refresh_cookie(client: TestClien
     assert "refresh_token" in response.cookies
 
 
-def test_login_wrong_password_rejected(client: TestClient):
+def test_login_wrong_password_rejected(client: TestClient) -> None:
     _register(client, "wrong@example.com")
     response = client.post(
-        "/auth/login", data={"username": "wrong@example.com", "password": "bad-password"}
+        "/auth/login",
+        data={"username": "wrong@example.com", "password": "bad-password"},
     )
     assert response.status_code == 401
 
 
-def test_login_nonexistent_user_rejected(client: TestClient):
+def test_login_nonexistent_user_rejected(client: TestClient) -> None:
     response = client.post(
         "/auth/login", data={"username": "ghost@example.com", "password": "whatever"}
     )
     assert response.status_code == 401
 
 
-def test_me_returns_current_user_with_valid_access_token(client: TestClient):
+def test_me_returns_current_user_with_valid_access_token(client: TestClient) -> None:
     login_response = _register_and_login(client, email="me@example.com")
     access_token = login_response.json()["access_token"]
-    response = client.get("/auth/me", headers={"Authorization": f"Bearer {access_token}"})
+    response = client.get(
+        "/auth/me", headers={"Authorization": f"Bearer {access_token}"}
+    )
     assert response.status_code == 200
     assert response.json()["email"] == "me@example.com"
 
 
-def test_me_rejects_missing_token(client: TestClient):
+def test_me_rejects_missing_token(client: TestClient) -> None:
     response = client.get("/auth/me")
     assert response.status_code == 401
 
 
-def test_refresh_rotates_token(client: TestClient):
+def test_refresh_rotates_token(client: TestClient) -> None:
     login_response = _register_and_login(client, email="refresh@example.com")
     old_cookie = login_response.cookies.get("refresh_token")
 
@@ -82,14 +91,15 @@ def test_refresh_rotates_token(client: TestClient):
     assert new_cookie != old_cookie
 
 
-def test_refresh_without_cookie_rejected(client: TestClient):
+def test_refresh_without_cookie_rejected(client: TestClient) -> None:
     response = client.post("/auth/refresh")
     assert response.status_code == 401
 
 
-def test_refresh_reuse_of_rotated_token_revokes_whole_chain(client: TestClient):
+def test_refresh_reuse_of_rotated_token_revokes_whole_chain(client: TestClient) -> None:
     login_response = _register_and_login(client, email="reuse@example.com")
     old_cookie = login_response.cookies.get("refresh_token")
+    assert old_cookie is not None
 
     # Primer refresh: rota el token, el viejo queda revocado. El cliente ya trae
     # el nuevo cookie guardado en su jar tras esta llamada.
@@ -109,7 +119,7 @@ def test_refresh_reuse_of_rotated_token_revokes_whole_chain(client: TestClient):
     assert should_fail.status_code == 401
 
 
-def test_logout_revokes_refresh_token(client: TestClient):
+def test_logout_revokes_refresh_token(client: TestClient) -> None:
     _register_and_login(client, email="logout@example.com")
 
     logout_response = client.post("/auth/logout")
@@ -119,7 +129,9 @@ def test_logout_revokes_refresh_token(client: TestClient):
     assert refresh_response.status_code == 401
 
 
-def test_refresh_with_expired_token_rejected(client: TestClient, db_session):
+def test_refresh_with_expired_token_rejected(
+    client: TestClient, db_session: Session
+) -> None:
     login_response = _register_and_login(client, email="expired@example.com")
     assert login_response.cookies.get("refresh_token") is not None
 
@@ -135,7 +147,7 @@ def test_refresh_with_expired_token_rejected(client: TestClient, db_session):
     assert response.json()["detail"] == "Refresh token expirado"
 
 
-def test_refresh_concurrent_requests_only_one_succeeds(client: TestClient):
+def test_refresh_concurrent_requests_only_one_succeeds(client: TestClient) -> None:
     """Dos requests simultáneos con el MISMO refresh token (doble pestaña, retry de
     red) no deben poder generar dos tokens hijos válidos para la misma family_id.
     Verifica el fix de la race condition (SELECT ... FOR UPDATE en app/api/auth.py)."""

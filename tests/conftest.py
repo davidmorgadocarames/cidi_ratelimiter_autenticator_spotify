@@ -1,7 +1,9 @@
+from collections.abc import Generator, Iterator
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
 from app.db.session import Base, get_db
@@ -13,20 +15,20 @@ TestSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=Fa
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _create_tables():
+def _create_tables() -> Generator[None, None, None]:
     Base.metadata.create_all(bind=test_engine)
     yield
     Base.metadata.drop_all(bind=test_engine)
 
 
 @pytest.fixture(autouse=True)
-def _clean_tables():
+def _clean_tables() -> Generator[None, None, None]:
     with test_engine.begin() as conn:
         conn.execute(text("TRUNCATE users, refresh_tokens RESTART IDENTITY CASCADE"))
     yield
 
 
-def _override_get_db():
+def _override_get_db() -> Iterator[Session]:
     db = TestSessionLocal()
     try:
         yield db
@@ -43,7 +45,7 @@ def client() -> TestClient:
 
 
 @pytest.fixture()
-def db_session():
+def db_session() -> Iterator[Session]:
     """Sesión directa a la DB de test, para manipular filas desde los tests
     (ej. forzar la expiración de un refresh token sin esperar 7 días reales)."""
     db = TestSessionLocal()

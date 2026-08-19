@@ -8,7 +8,12 @@ from app.api.totp import (
     register_totp_failure,
     register_totp_success,
 )
-from app.core.security import TOTPDecryptionError, decrypt_totp_secret, verify_password, verify_totp_code
+from app.core.security import (
+    TOTPDecryptionError,
+    decrypt_totp_secret,
+    verify_password,
+    verify_totp_code,
+)
 from app.db.session import get_db
 from app.models.user import User
 from app.schemas.user import PremiumActivateRequest, UserRead
@@ -29,6 +34,15 @@ def activate_premium(
         )
 
     locked_user = lock_user_for_totp_check(db, current_user.id)
+
+    # Re-chequeo sobre locked_user (no current_user): mypy no puede inferir que
+    # `totp_enabled` en current_user implica secreto no-nulo en esta fila recién
+    # re-leída bajo lock; además es una defensa real, no solo para el type-checker.
+    if locked_user.totp_secret_encrypted is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Configura 2FA antes de activar premium",
+        )
 
     check_totp_lockout(locked_user)
 
