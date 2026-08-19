@@ -1,0 +1,6 @@
+# TODO: Fase 5 - workflow de integración continua (tests, lint, mypy, matriz 3.10/3.11/3.12).
+# Sin triggers todavía para que no aparezca como "failing" en Actions antes de tener contenido real.
+name: CI (pendiente - Fase 5)
+
+on:
+  workflow_dispatch: {}

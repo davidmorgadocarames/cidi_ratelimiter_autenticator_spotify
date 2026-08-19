@@ -1,0 +1,10 @@
+# Fase 0: esqueleto vacío intencionalmente.
+# Los servicios reales se añaden progresivamente:
+#   - redis                  -> Fase 6 (standalone, para el rate limiter)
+#   - postgres + resto stack -> Fase 7 (contenedores completos + healthchecks)
+#   - minio                  -> Fase 8
+#   - meilisearch             -> Fase 10
+# Cada servicio se documentará en docs/architecture.md al añadirse.
+# (Sin clave `version:` - está deprecada en Compose v2.)
+
+services: {}

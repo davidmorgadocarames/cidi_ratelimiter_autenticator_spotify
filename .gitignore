@@ -1,4 +1,33 @@
+# Python
 .venv/
-pycache/
+__pycache__/
 *.pyc
+*.egg-info/
+
+# Env / secrets
 .env
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+celerybeat-schedule
+build/
+dist/
+
+# Bases de datos locales
+*.sqlite3
+*.db
+
+# Archivos subidos/generados localmente (audio, transcodificaciones)
+# Nota: solo se ignoran las carpetas de trabajo en runtime, NO extensiones de
+# audio en general, para no perder fixtures de test versionados (Fases 8-9).
+uploads/
+media/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store

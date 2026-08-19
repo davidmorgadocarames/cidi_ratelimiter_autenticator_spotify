@@ -1,0 +1,5 @@
+# TODO: Fase 14 - workflow de despliegue continuo (staging/production, tags, rollback).
+name: CD (pendiente - Fase 14)
+
+on:
+  workflow_dispatch: {}
