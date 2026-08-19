@@ -1,5 +1,7 @@
 # CIDI — Rate Limiter, Autenticador y "Spotify" API
 
+[![CI](https://github.com/davidmorgadocarames/cidi_ratelimiter_autenticator_spotify/actions/workflows/ci.yml/badge.svg)](https://github.com/davidmorgadocarames/cidi_ratelimiter_autenticator_spotify/actions/workflows/ci.yml)
+
 Repositorio: https://github.com/davidmorgadocarames/cidi_ratelimiter_autenticator_spotify
 
 Proyecto de portfolio que combina, sobre una API tipo Spotify con datos reales:
@@ -17,11 +19,12 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-4 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-5 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
-autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, y tooling de
-calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit). Ver el
+autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
+calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit), y CI real
+en GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12). Ver el
 roadmap completo abajo y el detalle de qué está implementado vs pendiente en
 [`docs/architecture.md`](docs/architecture.md).
 
@@ -181,6 +184,28 @@ FastAPI/SQLAlchemy/Pydantic correctamente requiere el entorno del proyecto insta
 significa que usa el `mypy` que encuentre en el `PATH` de quien commitea: **el venv debe estar
 activado** en la terminal donde se hace `git commit`, o el hook falla con
 `Executable 'mypy' not found`.
+
+## CI (GitHub Actions)
+
+`.github/workflows/ci.yml` corre en cada Pull Request contra `main` (y en cada push a `main`,
+como red de seguridad post-merge): las mismas herramientas de la sección anterior
+(`ruff check`, `black --check`, `mypy app tests`, `pytest --cov=app --cov-fail-under=85`) más
+`alembic upgrade head` contra un Postgres real levantado como servicio del propio job — ahora
+obligatorias en cada PR, no solo un hook local. Matriz de Python `3.10`, `3.11`, `3.12` (el mínimo
+soportado según se documentó desde la Fase 0, no la 3.13 del entorno local).
+
+**Setup necesario en GitHub antes del primer run** (una sola vez):
+
+1. **Secrets** — Settings → Secrets and variables → Actions → New repository secret. El workflow
+   necesita `JWT_SECRET_KEY`/`TOTP_ENCRYPTION_KEY` válidos (la app rechaza arrancar con el
+   placeholder `change-me`), pero son valores **efímeros de CI, no credenciales reales** — nunca
+   hardcodeados en el YAML por higiene (ver `docs/architecture.md`), sino como Secrets:
+   - `CI_JWT_SECRET_KEY`
+   - `CI_TOTP_ENCRYPTION_KEY`
+2. **Branch protection** — Settings → Branches → Add branch protection rule → branch name
+   pattern `main` → marcar "Require status checks to pass before merging" → seleccionar los 3
+   checks de la matriz (`test (3.10)`, `test (3.11)`, `test (3.12)`) una vez hayan corrido al
+   menos una vez (aparecen en la lista tras el primer PR). Esto bloquea el merge si el CI falla.
 
 ## Decisiones de diseño
 

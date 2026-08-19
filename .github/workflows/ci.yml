@@ -1,6 +1,84 @@
-# TODO: Fase 5 - workflow de integración continua (tests, lint, mypy, matriz 3.10/3.11/3.12).
-# Sin triggers todavía para que no aparezca como "failing" en Actions antes de tener contenido real.
-name: CI (pendiente - Fase 5)
+name: CI
 
 on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: spotify_clone
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U user -d spotify_clone"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+psycopg://user:password@localhost:5432/spotify_clone
+      TEST_DATABASE_URL: postgresql+psycopg://user:password@localhost:5432/spotify_clone_test
+      # Secrets de solo-CI: valores válidos pero sin ningún dato real detrás. Nunca
+      # hardcodeados en este YAML (ver docs/architecture.md) - configurar en
+      # Settings > Secrets and variables > Actions antes del primer run.
+      JWT_SECRET_KEY: ${{ secrets.CI_JWT_SECRET_KEY }}
+      TOTP_ENCRYPTION_KEY: ${{ secrets.CI_TOTP_ENCRYPTION_KEY }}
+      COOKIE_SECURE: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Create test database
+        # spotify_clone (POSTGRES_DB del servicio) ya existe al arrancar el
+        # contenedor; spotify_clone_test no. CREATE DATABASE no puede ejecutarse
+        # dentro de una transacción, de ahí autocommit=True explícito.
+        run: |
+          python -c "
+          import psycopg
+          conn = psycopg.connect('postgresql://user:password@localhost:5432/spotify_clone', autocommit=True)
+          conn.execute('CREATE DATABASE spotify_clone_test')
+          conn.close()
+          "
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (black)
+        run: black --check .
+
+      - name: Type check (mypy --strict)
+        run: mypy app tests
+
+      - name: Tests + coverage
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=85

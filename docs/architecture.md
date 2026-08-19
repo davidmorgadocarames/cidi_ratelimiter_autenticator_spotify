@@ -75,13 +75,34 @@ en funciones de test sin `-> None` y fixtures de `conftest.py` sin tipar, más d
 `app/` (`decode_access_token` devolviendo `dict` sin parámetros genéricos; `decrypt_totp_secret`
 recibiendo un `str | None` sin narrowing en `app/api/users.py`, resuelto con un chequeo explícito
 sobre la fila ya bloqueada, no solo para satisfacer al type-checker). Cero uso de `# type: ignore`
-— no hizo falta ninguno (`pyotp`/`qrcode` resultaron tener anotaciones suficientes para mypy sin
-necesitar los overrides de `ignore_missing_imports` que se habían dejado preparados por si acaso).
+— no hizo falta ninguno. *(Corrección posterior, Fase 5: el resumen original decía que ni
+`pyotp` ni `qrcode` necesitaban el override de `ignore_missing_imports` — impreciso. Verificado de
+nuevo: `pyotp` sí viene tipado y no lo necesita, pero `qrcode` no publica stubs/`py.typed` y mypy
+falla sin el override. El override para `qrcode.*` se mantiene en `pyproject.toml`, el de
+`pyotp.*` se quitó por innecesario.)*
 
 Cobertura real medida: **94%** (`pytest --cov=app`), sin umbral obligatorio todavía (ver
 Decisiones técnicas). Los huecos son en su mayoría ramas de error poco alcanzables en tests
 unitarios (`app/db/session.py` 69%, la construcción del engine/sesión en sí) y algunas líneas de
 `app/api/auth.py`/`app/core/config.py`.
+
+**Fase 5 — CI (GitHub Actions).** `.github/workflows/ci.yml` reemplaza el stub inerte de Fase 0:
+corre en cada Pull Request contra `main` y en cada push a `main` (`concurrency` con
+`cancel-in-progress` para no duplicar runs), matriz `python-version: ["3.10", "3.11", "3.12"]`,
+servicio Postgres (`postgres:16-alpine`, mismas credenciales que `docker-compose.yml`). Mismos
+pasos que el hook de pre-commit de Fase 4 más `alembic upgrade head` y `pytest --cov-fail-under=85`,
+ahora obligatorios en cada PR, no solo en un hook local que depende de que el venv esté activado.
+
+Toda la secuencia de comandos (crear `spotify_clone_test`, migrar, ruff, black, mypy, pytest con
+`--cov-fail-under=85`) se verificó localmente contra Postgres real antes de pushear, incluyendo
+una prueba aislada de la lógica de `CREATE DATABASE` (con `autocommit=True`, requisito de
+Postgres para ese comando) contra una base de datos descartable, sin tocar el `spotify_clone_test`
+real de desarrollo.
+
+Este es el primer push del proyecto a GitHub (`origin/main` solo tenía el commit inicial de
+scaffolding de agentes hasta ahora): se verificó explícitamente con
+`git log --all --full-history -- .env` que `.env` nunca se trackeó en ninguno de los 5 commits de
+Fases 0-4, antes de hacerlos públicos por primera vez.
 
 ## Diagrama de arquitectura
 
@@ -227,6 +248,30 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **`pytest-cov` sin `--cov-fail-under` todavía**: se mide la cobertura real (94%, ver Resumen)
   antes de comprometerse a un umbral — fijar uno arbitrario sin conocer el número real podría
   bloquear commits legítimos o quedar puesto artificialmente bajo. Se revisa en Fase 5.
+
+**Fase 5 — CI (GitHub Actions)**
+
+- **`--cov-fail-under=85`**, no el 94% real medido: deja margen razonable para fluctuaciones
+  normales fase a fase sin que el CI se ponga rojo por una caída pequeña y esperable, pero sí
+  bloquea una regresión real y significativa de cobertura en un PR futuro.
+- **DB de test creada en un paso explícito con `psycopg`, no vía bind-mount de
+  `docker/postgres-init/`**: los service containers de GitHub Actions arrancan antes de que
+  exista el checkout del repo, así que el mecanismo que funciona en local/docker-compose no es
+  aplicable en CI. `CREATE DATABASE` se ejecuta con `autocommit=True` explícito (Postgres no
+  permite ese comando dentro de una transacción) contra la base `spotify_clone` (que sí existe
+  desde el arranque del servicio, vía `POSTGRES_DB`), no contra `spotify_clone_test` (que aún no
+  existe en ese momento).
+- **`JWT_SECRET_KEY`/`TOTP_ENCRYPTION_KEY` como GitHub Secrets, no hardcodeados en el YAML**:
+  aunque son valores efímeros de CI sin ningún dato real detrás, la regla de "nunca secretos en
+  un repo público, ni falsos" evita por completo el riesgo de que alguien copie ese valor "que ya
+  funciona" a un `.env` real más adelante por conveniencia.
+- **Branch protection configurada manualmente por el usuario, no por mí**: no hay `gh` CLI
+  instalada en el entorno de desarrollo de este proyecto; instrucciones paso a paso en el README
+  en vez de intentarlo por la API REST directamente con curl y un token.
+- **Rama + PR real para esta fase, no commit directo a `main`**: a diferencia de las Fases 0-4
+  (commiteadas directo a `main`), esta se hizo vía PR para que el workflow de CI corriera de
+  verdad contra la matriz de Python antes de mergear — la primera demostración real de que
+  funciona, no solo de que la sintaxis del YAML es válida.
 
 ## Riesgos conocidos
 
