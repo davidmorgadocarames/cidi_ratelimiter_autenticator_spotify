@@ -1,0 +1,63 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+}
+
+body {
+  max-width: 28rem;
+  margin: 3rem auto;
+  padding: 0 1rem;
+}
+
+h1 {
+  font-size: 1.25rem;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.5rem;
+}
+
+label {
+  font-size: 0.875rem;
+  margin-top: 0.5rem;
+}
+
+input {
+  padding: 0.5rem;
+  font-size: 1rem;
+}
+
+button {
+  margin-top: 0.75rem;
+  padding: 0.5rem 1rem;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: #0969da;
+  text-decoration: underline;
+  font-size: inherit;
+  cursor: pointer;
+}
+
+.error {
+  color: #d1242f;
+  font-size: 0.875rem;
+}
+
+#dashboard-view button#logout {
+  margin-left: 0.5rem;
+}

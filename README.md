@@ -17,10 +17,31 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0 y 1 completadas** — scaffolding del proyecto, y API base con autenticación JWT
+🚧 **Fases 0, 1 y 2 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
-Postgres real. Ver el roadmap completo abajo y el detalle de qué está implementado vs pendiente en
-[`docs/architecture.md`](docs/architecture.md).
+Postgres real, y una UI mínima integrada (registro, login, dashboard con toggle de premium)
+servida por la propia API. Ver el roadmap completo abajo y el detalle de qué está implementado vs
+pendiente en [`docs/architecture.md`](docs/architecture.md).
+
+## Frontend: UI integrada vs frontend separado
+
+Para la Fase 2 se evaluó levantar un frontend separado (ej. Vite + JS/React con su propio dev
+server) frente a servir una UI mínima directamente desde FastAPI. Se eligió la **UI integrada**:
+HTML/CSS/JS vanilla en [`app/static/`](app/static/), servido como estáticos por la propia API
+(`StaticFiles` montado en `/`), mismo origen — sin CORS, sin build tooling, sin dependencias de
+frontend. Motivo: este es un proyecto de portfolio **backend-focused** (CI/CD, rate limiter,
+TOTP, streaming); un frontend separado añadiría complejidad (configuración de CORS, otro conjunto
+de dependencias, un proceso de build) sin aportar a lo que el proyecto quiere demostrar. La UI
+solo necesita ser suficiente para probar el login, el registro y el toggle de premium de verdad
+desde un navegador, no ser vistosa.
+
+Uso: con la API corriendo, abre `http://localhost:8000/` — permite registrarte o iniciar sesión,
+y desde el dashboard ver tu email, tu estado de premium y activarlo/desactivarlo (llama de verdad
+a `PATCH /users/me/premium`, protegido con el access token, no es un cambio solo visual). El
+access token vive únicamente en una variable JS en memoria (no en `localStorage`, ver
+[`docs/architecture.md`](docs/architecture.md) para el matiz de qué protege esto y qué no) — se
+pierde al recargar la página, pero un "silent refresh" (`POST /auth/refresh` vía la cookie
+`httpOnly`) recupera la sesión automáticamente sin pedir credenciales de nuevo.
 
 ## Stack técnico (previsto)
 
@@ -39,7 +60,7 @@ Postgres real. Ver el roadmap completo abajo y el detalle de qué está implemen
 | ---- | --------- |
 | 0 | Scaffolding del proyecto |
 | 1 | API base y autenticación (JWT) |
-| 2 | UI de login y toggle de premium |
+| 2 | UI de login y registro, toggle de premium |
 | 3 | Autenticación de dos factores (TOTP) |
 | 4 | Calidad de código local (pytest-cov, ruff, black, mypy, pre-commit) |
 | 5 | CI (GitHub Actions, matriz de Python) |

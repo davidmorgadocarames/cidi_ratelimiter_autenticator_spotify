@@ -20,6 +20,23 @@ migraciones con Alembic. 13 tests (`tests/test_auth.py`) corriendo contra una ba
 Postgres real (no mocks/SQLite), incluyendo rotación, detección de reuso, expiración real y una
 race condition de dos refresh simultáneos con el mismo token.
 
+**Fase 2 — UI mínima + toggle de premium.** UI servida como estáticos en `/`
+(`app/static/index.html`, `app.js`, `style.css`): tres vistas (cargando, auth con login+registro,
+dashboard) en una sola página, sin framework ni build tooling. Nuevo endpoint
+`PATCH /users/me/premium` (`app/api/users.py`), protegido con la misma dependencia
+`get_current_user` de Fase 1, body explícito `{"is_premium": bool}` (schema `PremiumUpdate`).
+Nueva columna `is_premium` en `User` (migración `e43601f7d62c`). 8 tests nuevos
+(`tests/test_users.py`, `tests/test_main.py`) — incluyen rechazo de payload inválido (422) y una
+regresión que verifica que el mount de estáticos en `/` no tapa las rutas de `/auth/*` ni `/health`.
+
+Verificación manual en navegador real (no solo tests): flujo completo conducido con Playwright
+headless + capturas de pantalla — primera visita sin parpadeo, registro con auto-login, toggle de
+premium con estado de carga correcto, recarga de página con silent refresh manteniendo la sesión
+y el estado premium, logout, error de credenciales incorrectas, error de email duplicado con
+link a login. Esta verificación encontró y permitió corregir un bug real que los tests
+automatizados no habían cubierto: el botón de toggle mostraba el label equivocado tras un cambio
+exitoso (ver `withLoading` en `app/static/app.js`).
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -34,7 +51,7 @@ proyecto de portfolio).
 | ---- | ----------------------------------------- | ------------- |
 | 0    | Scaffolding del proyecto                  | ✅ Implementado |
 | 1    | API base y autenticación (JWT)            | ✅ Implementado |
-| 2    | UI de login y toggle de premium           | ⬜ Pendiente    |
+| 2    | UI de login y toggle de premium           | ✅ Implementado |
 | 3    | 2FA (TOTP)                                | ⬜ Pendiente    |
 | 4    | Calidad de código local                   | ⬜ Pendiente    |
 | 5    | CI                                        | ⬜ Pendiente    |
@@ -93,6 +110,27 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **`JWT_SECRET_KEY` no puede quedar en su valor placeholder**: `Settings` rechaza arrancar si
   sigue en `"change-me"` (falla rápido en vez de firmar tokens con un secreto público conocido).
 
+**Fase 2 — UI mínima y toggle de premium**
+
+- **UI mínima integrada en FastAPI, no frontend separado**: HTML/CSS/JS vanilla servido como
+  estáticos por la propia API (mismo origen, sin CORS, sin build tooling). Justificación completa
+  en el README (sección "Frontend: UI integrada vs frontend separado") — el foco de este proyecto
+  es backend, no frontend.
+- **Formulario de registro incluido en la UI** (no solo login): permite probar el flujo completo
+  desde el navegador sin pasar antes por curl/pytest.
+- **"Silent refresh" al cargar la página**: `POST /auth/refresh` (la cookie httpOnly viaja sola)
+  al iniciar, para no perder la sesión en cada recarga — el access token vive solo en una variable
+  JS en memoria, no en `localStorage`.
+- **PATCH con valor explícito `is_premium`, no un "toggle puro"**: evita que un reintento de red
+  invierta el estado dos veces sin que el usuario lo note.
+- **Matiz sobre "access token en memoria, no localStorage"**: reduce el robo *pasivo* (una
+  extensión de navegador maliciosa u otro script leyendo `localStorage`), pero **no** protege
+  frente a un XSS activo en la propia página — con ejecución de JS arbitraria ahí, un atacante no
+  necesita leer la variable: puede llamar él mismo a `POST /auth/refresh` (la cookie se envía
+  igual; `httpOnly` bloquea la *lectura* por JS, no el *envío* por el navegador) o interceptar
+  `fetch`/`XMLHttpRequest` para capturar el header `Authorization` en la próxima llamada real. No
+  se presenta como mitigación de XSS, solo de robo pasivo de credenciales en reposo.
+
 ## Riesgos conocidos
 
 - **Desalineación de versión de Python**: el entorno de desarrollo local usa Python 3.13 (única
@@ -114,6 +152,10 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **`COOKIE_SECURE=true` por defecto requiere HTTPS**: en desarrollo local por `http://` hay que
   poner `COOKIE_SECURE=false` en `.env` (así está configurado en el `.env` local), o el navegador
   no enviará la cookie del refresh token.
+- **`PATCH /users/me/premium` solo exige un access token válido** (sin contraseña ni TOTP): con
+  un access token robado (válido hasta 30 min) se puede activar/desactivar premium sin fricción
+  adicional. Aceptado como limitación conocida para la Fase 2; la Fase 3 añade contraseña + TOTP
+  específicamente para la activación, sobre este mismo endpoint.
 
 ## Cómo escalaría esto en producción real
 

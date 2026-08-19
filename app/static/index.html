@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CIDI Spotify Clone</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main id="loading-view">
+    <p>Cargando…</p>
+  </main>
+
+  <main id="auth-view" hidden>
+    <h1>CIDI Spotify Clone</h1>
+
+    <section id="login-section">
+      <h2>Iniciar sesión</h2>
+      <form id="login-form" novalidate>
+        <label for="login-email">Email</label>
+        <input id="login-email" name="email" type="email" required autocomplete="email">
+
+        <label for="login-password">Contraseña</label>
+        <input id="login-password" name="password" type="password" required autocomplete="current-password">
+
+        <p class="error" id="login-error" role="alert" tabindex="-1" hidden></p>
+
+        <button type="submit" id="login-submit">Iniciar sesión</button>
+      </form>
+      <p>¿No tienes cuenta? <button type="button" id="show-register" class="link-button">Regístrate</button></p>
+    </section>
+
+    <section id="register-section" hidden>
+      <h2>Crear cuenta</h2>
+      <form id="register-form" novalidate>
+        <label for="register-email">Email</label>
+        <input id="register-email" name="email" type="email" required autocomplete="email">
+
+        <label for="register-password">Contraseña</label>
+        <input id="register-password" name="password" type="password" required minlength="8" autocomplete="new-password">
+
+        <p class="error" id="register-error" role="alert" tabindex="-1" hidden></p>
+
+        <button type="submit" id="register-submit">Crear cuenta</button>
+      </form>
+      <p>¿Ya tienes cuenta? <button type="button" id="show-login" class="link-button">Inicia sesión</button></p>
+    </section>
+  </main>
+
+  <main id="dashboard-view" hidden>
+    <h1>CIDI Spotify Clone</h1>
+    <p>Sesión iniciada como <strong id="dashboard-email"></strong></p>
+    <p>Premium: <strong id="premium-status" aria-live="polite">No</strong></p>
+    <p class="error" id="dashboard-error" role="alert" tabindex="-1" hidden></p>
+    <button type="button" id="toggle-premium">Activar premium</button>
+    <button type="button" id="logout">Cerrar sesión</button>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

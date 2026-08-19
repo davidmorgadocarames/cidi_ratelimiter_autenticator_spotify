@@ -23,7 +23,12 @@ class UserRead(BaseModel):
     id: int
     email: EmailStr
     is_active: bool
+    is_premium: bool
     created_at: datetime
+
+
+class PremiumUpdate(BaseModel):
+    is_premium: bool
 
 
 class Token(BaseModel):
