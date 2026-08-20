@@ -6,10 +6,16 @@ target-version = "py310"
 select = ["E", "F", "I", "UP", "B", "SIM", "C4"]
 
 [tool.ruff.lint.flake8-bugbear]
-# Patrón estándar/recomendado de FastAPI: Depends(...) como valor por defecto de un
-# parámetro, evaluado por FastAPI en cada request, no una única vez al definir la
-# función (que es lo que B008 previene en el caso general). Falso positivo conocido.
-extend-immutable-calls = ["fastapi.Depends", "fastapi.params.Depends"]
+# Patrón estándar/recomendado de FastAPI: Depends(...)/File(...)/Form(...) como
+# valor por defecto de un parámetro, evaluado por FastAPI en cada request, no una
+# única vez al definir la función (que es lo que B008 previene en el caso
+# general). Falso positivo conocido.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.params.Depends",
+    "fastapi.File",
+    "fastapi.Form",
+]
 
 [tool.black]
 line-length = 88

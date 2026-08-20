@@ -18,6 +18,13 @@ FROM python:3.12.7-slim-bookworm
 
 RUN groupadd --system app && useradd --system --gid app --no-create-home app
 
+# ffmpeg no es un paquete pip - se necesita el binario de sistema (junto con
+# ffprobe, incluido en el mismo paquete Debian) para transcodificar audio
+# (Fase 8). Crece la imagen de forma no trivial (~150-200MB, cuantificado en
+# docs/architecture.md) - trade-off aceptado, es funcionalidad requerida.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv

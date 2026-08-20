@@ -19,15 +19,16 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-7 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-8 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
 calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit), CI real en
 GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12), rate
-limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta, y la API
+limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta, la API
 completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados con
-postgres/redis, smoke test en CI). Ver el roadmap completo abajo y el detalle de qué está
+postgres/redis, smoke test en CI), y subida/transcodificación de audio (`ffmpeg` + MinIO) con un
+catálogo público de canciones. Ver el roadmap completo abajo y el detalle de qué está
 implementado vs pendiente en
 [`docs/architecture.md`](docs/architecture.md).
 
@@ -126,6 +127,20 @@ mismo tipo de *lost update* que ya apareció y se corrigió en Postgres para la 
 tokens y el lockout de TOTP). Detalle completo del diseño, los dos tiers y el trade-off de
 fail-open en [`docs/architecture.md`](docs/architecture.md).
 
+## Subida y transcodificación de audio (Fase 8)
+
+`POST /songs` (multipart: `title`, `artist`, `file`) sube un archivo de audio, lo valida de verdad
+con `ffprobe` (nunca confiando en el `Content-Type` que declara el cliente — fácilmente
+falseable), lo transcodifica a mp3 192kbps con `ffmpeg`, y guarda tanto el original como el
+transcodificado en MinIO (compatible S3, vía `boto3`). Todo síncrono dentro del propio request —
+sin cola de tareas todavía (Celery es Fase 11) — así que una subida grande mantiene ocupado un
+hilo del servidor mientras dura. `GET /songs`/`GET /songs/{id}` exponen el catálogo, público para
+cualquier usuario autenticado (no solo el que subió cada canción) — más fiel a un clon real de
+Spotify que un catálogo privado por usuario. Sin URL de descarga todavía ni endpoint de borrado —
+eso y el streaming real (Range Requests) son Fase 9. Decisiones completas, límites (20MB por
+archivo) y riesgos aceptados (agotamiento del threadpool compartido bajo subidas concurrentes,
+filas atascadas si el proceso muere a mitad) en [`docs/architecture.md`](docs/architecture.md).
+
 ## Stack técnico (previsto)
 
 - **Backend**: Python 3 + FastAPI
@@ -163,7 +178,10 @@ fail-open en [`docs/architecture.md`](docs/architecture.md).
 Requiere Python 3.13 en local (única versión instalada en esta máquina). El CI (Fase 5) corre
 además la suite completa contra 3.10/3.11/3.12 en GitHub Actions — verificado en verde en las
 tres, ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos). Requiere también
-Docker (para Postgres, adelantado a la Fase 1; y Redis, adelantado a la Fase 6).
+Docker (para Postgres, adelantado a la Fase 1; Redis, adelantado a la Fase 6; y MinIO, Fase 8), y
+`ffmpeg`/`ffprobe` instalados en el sistema (Fase 8, subida/transcodificación de audio — **no** es
+un paquete pip, es un binario de sistema; en Windows: `winget install --id Gyan.FFmpeg -e`,
+verificar con `ffmpeg -version`; dentro de Docker ya viene instalado en la imagen, ver Dockerfile).
 
 ```bash
 python -m venv .venv
@@ -185,13 +203,16 @@ Copia `.env.example` a `.env` y completa los valores. Desde la Fase 1 son obliga
 placeholder `change-me` — genera uno real con `openssl rand -hex 32`) y `COOKIE_SECURE` (`false`
 en desarrollo local sin HTTPS). `REDIS_URL` (Fase 6) no es estrictamente obligatoria — tiene
 un valor por defecto (`redis://localhost:6379/0`) sin validador de placeholder, a diferencia de
-`JWT_SECRET_KEY` — pero hay que asegurarse de que apunte al Redis real que se levante. El resto de
+`JWT_SECRET_KEY` — pero hay que asegurarse de que apunte al Redis real que se levante.
+`S3_ACCESS_KEY`/`S3_SECRET_KEY` (Fase 8) sí tienen el mismo validador anti-`change-me` que
+`JWT_SECRET_KEY` — deben coincidir con `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` del servicio
+`minio` de `docker-compose.yml` (que los lee del propio `.env`, ver esa sección). El resto de
 variables se van sumando fase a fase.
 
-Levantar Postgres y Redis, y aplicar las migraciones, antes de correr la API o los tests:
+Levantar Postgres, Redis y MinIO, y aplicar las migraciones, antes de correr la API o los tests:
 
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres redis minio
 alembic upgrade head
 uvicorn app.main:app --reload
 # en otra terminal
@@ -210,7 +231,7 @@ placeholder `change-me`) — el `ENTRYPOINT` migra al arrancar y esa migración 
 a la vez, o el segundo falla con "address already in use".
 
 ```bash
-docker compose up -d --build   # postgres + redis + la API, las 3 healthy antes de servir tráfico
+docker compose up -d --build   # postgres + redis + minio + la API, las 4 healthy antes de servir
 curl http://localhost:8000/health
 ```
 

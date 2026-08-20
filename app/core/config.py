@@ -24,6 +24,11 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
+    s3_endpoint_url: str = "http://localhost:9000"
+    s3_access_key: str = "change-me"
+    s3_secret_key: str = "change-me"
+    s3_bucket_name: str = "songs"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:
@@ -51,6 +56,17 @@ class Settings(BaseSettings):
                 "TOTP_ENCRYPTION_KEY no es una clave Fernet válida "
                 "(debe ser base64 urlsafe de 32 bytes)."
             ) from exc
+        return value
+
+    @field_validator("s3_access_key", "s3_secret_key")
+    @classmethod
+    def _reject_placeholder_s3_credentials(cls, value: str) -> str:
+        if value == "change-me":
+            raise ValueError(
+                "S3_ACCESS_KEY/S3_SECRET_KEY siguen en el valor placeholder "
+                "'change-me'. Pon las credenciales reales de MinIO en .env "
+                "(MINIO_ROOT_USER/MINIO_ROOT_PASSWORD del servicio minio)."
+            )
         return value
 
 

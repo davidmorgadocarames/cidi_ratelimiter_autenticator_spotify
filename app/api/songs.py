@@ -1,0 +1,203 @@
+import logging
+import os
+import tempfile
+from pathlib import Path
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.api.auth import get_current_user
+from app.db.session import get_db
+from app.models.song import Song
+from app.models.user import User
+from app.schemas.song import SongRead
+from app.services import storage
+from app.services.transcode import (
+    TranscodeError,
+    probe_duration_seconds,
+    transcode_to_mp3,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/songs", tags=["songs"])
+
+# 20 MB: margen para un mp3 de varios minutos en bitrate alto sin permitir
+# subidas que agoten disco/memoria sin límite. Starlette/FastAPI no imponen
+# ningún límite de tamaño por sí solos - hay que aplicarlo explícitamente.
+# LIMITACIÓN CONOCIDA (no resuelta en esta fase, documentada en
+# docs/architecture.md): con UploadFile de alto nivel, Starlette ya parsea el
+# multipart completo y lo vuelca a un SpooledTemporaryFile propio (a disco a
+# partir de ~1MB) ANTES de que este código se ejecute. Este límite acota lo
+# que la propia app procesa/persiste/transcodifica y sube a MinIO, pero no
+# evita que Starlette reciba y spoolee a disco el cuerpo completo de una
+# subida enorme antes de este punto. Una defensa completa exigiría leer el
+# stream crudo de la request a mano - desproporcionado para el alcance de
+# esta fase.
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+_CHUNK_SIZE = 1024 * 1024
+
+_GENERIC_FAILURE_MESSAGE = "No se pudo procesar el archivo de audio."
+
+
+def _reject_if_content_length_too_large(request: Request) -> None:
+    content_length = request.headers.get("content-length")
+    if content_length is None:
+        return
+    try:
+        declared_size = int(content_length)
+    except ValueError:
+        # Header malformado: se ignora aquí, la lectura en chunks de abajo
+        # sigue siendo la defensa real (esto es solo un atajo barato).
+        return
+    if declared_size > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="El archivo supera el tamaño máximo permitido (20 MB)",
+        )
+
+
+def _read_upload_to_tempfile(file: UploadFile) -> tuple[str, int]:
+    """Copia el UploadFile a un temporal propio en chunks, cortando en 413 si
+    supera el límite. El nombre del temporal lo genera el SO (tempfile) - NUNCA
+    se deriva de file.filename (dato controlado por el cliente)."""
+    fd, path = tempfile.mkstemp(suffix=".upload")
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            while True:
+                chunk = file.file.read(_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="El archivo supera el tamaño máximo permitido (20 MB)",
+                    )
+                out.write(chunk)
+    except Exception:
+        Path(path).unlink(missing_ok=True)
+        raise
+    return path, total
+
+
+@router.post("", response_model=SongRead, status_code=status.HTTP_201_CREATED)
+def upload_song(
+    request: Request,
+    title: str = Form(...),
+    artist: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Song:
+    _reject_if_content_length_too_large(request)
+    original_path, file_size = _read_upload_to_tempfile(file)
+    transcoded_path: str | None = None
+
+    try:
+        try:
+            duration = probe_duration_seconds(original_path)
+        except TranscodeError as exc:
+            logger.warning("Archivo de audio inválido en /songs: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Archivo de audio inválido",
+            ) from exc
+
+        song = Song(
+            title=title,
+            artist=artist,
+            uploaded_by_id=current_user.id,
+            status="processing",
+            # Key fija, nunca derivada de file.filename - ver app/services/storage.py.
+            original_object_key="",
+            content_type=file.content_type or "application/octet-stream",
+            file_size_bytes=file_size,
+        )
+        db.add(song)
+        # flush (no commit): asigna song.id sin cerrar la transacción, así se
+        # puede construir la key real y guardar todo en un único commit -
+        # evita el round-trip extra y la ventana en la que otra transacción
+        # podría leer la fila con original_object_key="" todavía.
+        db.flush()
+
+        original_key = f"original/{song.id}/source"
+        song.original_object_key = original_key
+        db.commit()
+        db.refresh(song)
+
+        uploaded_keys: list[str] = []
+        try:
+            storage.upload_file(original_key, original_path, song.content_type)
+            uploaded_keys.append(original_key)
+
+            fd, transcoded_path = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            transcode_to_mp3(original_path, transcoded_path)
+
+            transcoded_key = f"transcoded/{song.id}.mp3"
+            storage.upload_file(transcoded_key, transcoded_path, "audio/mpeg")
+            uploaded_keys.append(transcoded_key)
+
+            song.status = "ready"
+            song.duration_seconds = duration
+            song.transcoded_object_key = transcoded_key
+            db.commit()
+            db.refresh(song)
+        except Exception:
+            logger.exception("Fallo procesando la canción %s", song.id)
+            # Limpieza best-effort de lo que sí llegó a subirse a MinIO antes
+            # del fallo - sin esto quedarían objetos huérfanos en el bucket
+            # (encontrado en la revisión post-implementación: delete_object
+            # existía pero nunca se llamaba).
+            for key in uploaded_keys:
+                storage.delete_object(key)
+            song.status = "failed"
+            song.error_message = _GENERIC_FAILURE_MESSAGE
+            db.commit()
+            db.refresh(song)
+
+        return song
+    finally:
+        Path(original_path).unlink(missing_ok=True)
+        if transcoded_path is not None:
+            Path(transcoded_path).unlink(missing_ok=True)
+
+
+@router.get("", response_model=list[SongRead])
+def list_songs(
+    limit: int = 50,
+    offset: int = 0,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[Song]:
+    return list(
+        db.scalars(
+            select(Song).order_by(Song.created_at.desc()).limit(limit).offset(offset)
+        )
+    )
+
+
+@router.get("/{song_id}", response_model=SongRead)
+def get_song(
+    song_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Song:
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Canción no encontrada"
+        )
+    return song
