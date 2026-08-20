@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     totp_encryption_key: str = "change-me"
 
+    redis_url: str = "redis://localhost:6379/0"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:

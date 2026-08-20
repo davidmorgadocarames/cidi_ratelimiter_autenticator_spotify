@@ -25,6 +25,7 @@ exclude = ["app/db/migrations/versions/"]
 module = ["qrcode.*"]
 ignore_missing_imports = true
 
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Sin esto, "pytest ..." (invocado directo, no como "python -m pytest") no

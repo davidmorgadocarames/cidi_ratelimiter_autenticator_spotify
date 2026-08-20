@@ -15,3 +15,6 @@ python-multipart==0.0.12
 pyotp==2.9.0
 qrcode[pil]==8.0
 cryptography==43.0.3
+
+# Fase 6: rate limiter (token bucket)
+redis==5.2.0

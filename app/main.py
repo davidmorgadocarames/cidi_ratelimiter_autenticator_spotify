@@ -4,8 +4,11 @@ from fastapi.staticfiles import StaticFiles
 from app.api.auth import router as auth_router
 from app.api.totp import router as totp_router
 from app.api.users import router as users_router
+from app.core.rate_limiter import RateLimitMiddleware
 
 app = FastAPI(title="CIDI Spotify Clone API")
+
+app.add_middleware(RateLimitMiddleware)
 
 app.include_router(auth_router)
 app.include_router(users_router)
