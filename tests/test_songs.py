@@ -347,3 +347,137 @@ def test_presigned_url_expires_after_ttl(
 
     response = httpx.get(short_lived_url)
     assert response.status_code >= 400
+
+
+def test_search_finds_uploaded_song_immediately_by_title(
+    client: TestClient, sample_audio_file: Path
+) -> None:
+    """Sin sleep/retry: index_song espera la task de Meilisearch antes de que
+    POST /songs responda 201, así que la canción ya es buscable en cuanto
+    llega la respuesta - prueba real de que no hay ventana de carrera."""
+    token = _register_and_login(client, "search-title@example.com")
+    _upload(client, token, sample_audio_file, title="Bohemian Rhapsody", artist="Queen")
+
+    response = client.get(
+        "/songs/search", params={"q": "bohemian"}, headers=_headers(token)
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert any(r["title"] == "Bohemian Rhapsody" for r in results)
+
+
+def test_search_finds_uploaded_song_by_artist(
+    client: TestClient, sample_audio_file: Path
+) -> None:
+    token = _register_and_login(client, "search-artist@example.com")
+    _upload(client, token, sample_audio_file, title="Otra canción", artist="Radiohead")
+
+    response = client.get(
+        "/songs/search", params={"q": "radiohead"}, headers=_headers(token)
+    )
+    assert response.status_code == 200
+    results = response.json()
+    assert any(r["artist"] == "Radiohead" for r in results)
+
+
+def test_search_no_results_returns_empty_list(client: TestClient) -> None:
+    token = _register_and_login(client, "search-empty@example.com")
+    response = client.get(
+        "/songs/search",
+        params={"q": "algo-que-no-existe-en-ningun-titulo-xyz"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_search_excludes_non_ready_songs(
+    client: TestClient, db_session: Session
+) -> None:
+    """Solo se indexan las canciones status="ready" - una creada directo con
+    status="processing"/"failed" nunca pasó por index_song, así que no
+    debería aparecer en resultados de búsqueda aunque el título coincida."""
+    token = _register_and_login(client, "search-notready@example.com")
+    me = client.get("/auth/me", headers=_headers(token)).json()
+    _create_song_directly(db_session, me["id"], "processing")
+
+    response = client.get(
+        "/songs/search", params={"q": "Canción de prueba"}, headers=_headers(token)
+    )
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_search_requires_auth(client: TestClient) -> None:
+    response = client.get("/songs/search", params={"q": "algo"})
+    assert response.status_code == 401
+
+
+def test_list_songs_excludes_non_ready_songs(
+    client: TestClient, db_session: Session, sample_audio_file: Path
+) -> None:
+    """Ajuste alineado de la Fase 10: GET /songs ya no lista canciones
+    "processing"/"failed" - antes las incluía sin filtrar."""
+    token = _register_and_login(client, "list-notready@example.com")
+    me = client.get("/auth/me", headers=_headers(token)).json()
+    not_ready = _create_song_directly(db_session, me["id"], "processing")
+    ready_upload = _upload(client, token, sample_audio_file, title="Sí listada")
+    ready_id = ready_upload.json()["id"]
+
+    listing = client.get("/songs", headers=_headers(token)).json()
+    listed_ids = {song["id"] for song in listing}
+    assert ready_id in listed_ids
+    assert not_ready.id not in listed_ids
+
+
+def test_upload_indexing_failure_does_not_block_upload(
+    client: TestClient, sample_audio_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Fallo de indexación en Meilisearch (simulado) no debe bloquear la
+    subida - MinIO/ffmpeg ya tuvieron éxito, la canción sigue siendo 201/
+    status="ready" (best-effort, ver app/services/search.py)."""
+
+    def _boom(_song: Song) -> None:
+        raise RuntimeError("Meilisearch simulado explotando")
+
+    monkeypatch.setattr("app.api.songs.search.index_song", _boom)
+
+    token = _register_and_login(client, "index-failure@example.com")
+    response = _upload(client, token, sample_audio_file)
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "ready"
+
+
+def test_search_returns_503_when_meilisearch_unreachable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Meilisearch caído al BUSCAR (no al indexar) no debe devolver una lista
+    vacía engañosa - search_songs propaga la excepción, el endpoint responde
+    503 explícito."""
+
+    def _boom(_query: str, limit: int, offset: int) -> list[dict[str, object]]:
+        raise RuntimeError("Meilisearch inalcanzable simulado")
+
+    monkeypatch.setattr("app.api.songs.search.search_songs", _boom)
+
+    token = _register_and_login(client, "search-down@example.com")
+    response = client.get(
+        "/songs/search", params={"q": "algo"}, headers=_headers(token)
+    )
+    assert response.status_code == 503
+
+
+def test_search_rejects_invalid_limit_with_422_not_503(client: TestClient) -> None:
+    """Un limit/offset inválido (ej. negativo) es un error de validación de
+    entrada (422), no una caída del buscador (503) - hallazgo de la revisión
+    post-implementación: sin Query(ge=..., le=...), este valor llegaba crudo a
+    Meilisearch, que respondía 400, y el except genérico del endpoint lo
+    convertía en un 503 engañoso."""
+    token = _register_and_login(client, "search-invalid-limit@example.com")
+    response = client.get(
+        "/songs/search",
+        params={"q": "algo", "limit": -1},
+        headers=_headers(token),
+    )
+    assert response.status_code == 422

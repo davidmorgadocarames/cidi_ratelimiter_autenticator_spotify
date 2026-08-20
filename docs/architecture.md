@@ -356,6 +356,39 @@ stream de una canción de A), y expiración real (`expires_in=1` + `time.sleep(2
 de una firma lo valida el reloj de MinIO server-side, no hay timestamp en Postgres/Redis que
 manipular como en fases anteriores).
 
+**Fase 10 — Búsqueda (Meilisearch).** Nuevo endpoint `GET /songs/search` (`app/api/songs.py`,
+registrado antes de `GET /songs/{song_id}` en el archivo — Starlette resuelve rutas en orden de
+registro, y la validación de `song_id: int` solo ocurre *después* de que una ruta ya hizo match, así
+que registrar `/{song_id}` primero habría hecho que `/songs/search` matcheara ahí con
+`song_id="search"` en vez de llegar al endpoint de búsqueda). Nuevo módulo
+`app/services/search.py`, mismo patrón que `storage.py`/`transcode.py`: cliente
+`meilisearch.Client` a nivel de módulo con timeout corto, `ensure_index_exists()` llamado una vez
+en el `lifespan` de `app/main.py` (con su propio `try/except` fail-open, mensaje de log separado
+del de MinIO), `index_song()` best-effort llamado desde `upload_song` tras terminar el pipeline de
+MinIO/ffmpeg (fuera de su `try/except`, ver Decisiones técnicas), y `search_songs()` que sí propaga
+errores. Cada canción se indexa con los mismos campos que expone `SongRead`; el endpoint de
+búsqueda construye la respuesta directo desde los documentos de Meilisearch, sin volver a consultar
+Postgres.
+
+Encontrado empíricamente durante la implementación, no anticipado en el plan: Meilisearch no pudo
+auto-inferir la primary key del documento (dos campos terminan en "id": `id`, `uploaded_by_id`),
+falló con `index_primary_key_multiple_candidates_found` hasta especificar `primaryKey: "id"`
+explícito al crear el índice. También encontrado en implementación: la decisión original del plan
+de no publicar el puerto 7700 de Meilisearch al host (hallazgo de la revisión de seguridad del
+plan) resultó incompatible con cómo corren los tests de este proyecto — desde el host, contra
+infraestructura real, igual que Postgres/Redis/MinIO — y se revirtió tras romper la suite completa
+(73 errores de conexión); ver Decisiones técnicas y Riesgos conocidos para el detalle completo del
+trade-off.
+
+8 tests nuevos en `tests/test_songs.py`: búsqueda inmediata por título y por artista tras subir
+(sin `sleep`/retry — `index_song` espera la task de Meilisearch antes de devolver el control, a
+diferencia de la expiración de URLs de la Fase 9), sin resultados devuelve `200` con lista vacía,
+canciones `"processing"`/`"failed"` no aparecen en resultados, `401` sin autenticación, `GET
+/songs` ya no incluye canciones no-`"ready"`, fallo de indexación (monkeypatch de `index_song`) no
+bloquea la subida, y Meilisearch caído al buscar (monkeypatch de `search_songs`) responde `503`.
+Verificado también manualmente con `curl` real contra el stack dockerizado completo (subida +
+búsqueda inmediata).
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -378,7 +411,7 @@ proyecto de portfolio).
 | 7    | Contenedores                              | ✅ Implementado |
 | 8    | Subida y transcodificación de audio       | ✅ Implementado |
 | 9    | Streaming de audio                        | ✅ Implementado |
-| 10   | Búsqueda                                  | ⬜ Pendiente    |
+| 10   | Búsqueda                                  | ✅ Implementado |
 | 11   | Recomendaciones precalculadas (Celery)    | ⬜ Pendiente    |
 | 12   | Caché de contenido popular                | ⬜ Pendiente    |
 | 13   | Sincronización entre dispositivos         | ⬜ Pendiente    |
@@ -730,6 +763,61 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   enlaces de descarga de todo el catálogo en bucle, mitigado porque los metadatos ya son públicos
   de todos modos y cada URL expira en 15 minutos.
 
+**Fase 10 — Búsqueda**
+
+- **`GET /songs/search` dedicado, no un parámetro `q` sobre `GET /songs`**: mismo principio de
+  separación de responsabilidades ya aplicado a `storage.py`/`transcode.py` — decisión confirmada
+  por el usuario en la revisión del plan.
+- **Indexación best-effort, búsqueda no**: si indexar en Meilisearch falla tras una subida exitosa
+  (MinIO+ffmpeg ya funcionaron, la canción es reproducible), la subida sigue siendo `201`/
+  `status="ready"` igual — se loguea, sin rollback, mismo principio de fail-open que Redis (Fase 6)
+  y el arranque sin MinIO (Fase 8/9). `search_songs`, en cambio, **sí propaga** la excepción si
+  Meilisearch no responde al *buscar* — devolver una lista vacía en ese caso sería engañoso
+  (parecería "sin resultados" en vez de "el buscador está caído"); el endpoint la convierte en
+  `503` explícito. Defensa en profundidad en dos capas: `index_song()` no confía en que su llamador
+  solo la invoque para canciones `status="ready"` (lo re-comprueba), y el propio call-site en
+  `upload_song` envuelve la llamada en su propio `try/except` sin confiar en que `index_song` nunca
+  vaya a propagar (encontrado en implementación: un test que monkeypatchea `index_song` entero para
+  simular un fallo rompía la subida sin esta segunda capa, porque el monkeypatch reemplaza también
+  la protección interna de la función real).
+- **Sin re-consultar Postgres al buscar**: el endpoint construye `SongRead` directamente desde los
+  documentos que devuelve Meilisearch (mismo conjunto de campos que ya expone `SongRead`). Válido
+  mientras no exista `PATCH`/`DELETE` de canciones — hoy una canción `ready` no cambia ni
+  desaparece, así que no hay escenario real de desincronización que justifique el coste de una
+  segunda consulta. Habría que revisitarlo si se añade edición/borrado en una fase futura.
+- **Primary key explícito (`primaryKey: "id"`) al crear el índice**: encontrado empíricamente en
+  implementación, no anticipado en el plan — el documento indexado tiene dos campos que terminan en
+  "id" (`id`, `uploaded_by_id`), y Meilisearch no puede auto-inferir la primary key cuando hay más
+  de un candidato (`index_primary_key_multiple_candidates_found`).
+- **Sin `sleep`/retry en los tests de búsqueda, a diferencia de la expiración de URLs firmadas
+  (Fase 9)**: `index_song` espera la task de indexación (`wait_for_task`) antes de devolver el
+  control — Meilisearch no tiene un `refresh_interval` tipo Elasticsearch, `task.status ==
+  "succeeded"` implica que el documento ya es buscable de inmediato. La Fase 9 sí necesitaba tiempo
+  de reloj real porque la expiración de una URL firmada es un timer externo, no una task interna
+  consultable.
+- **Puerto 7700 SÍ publicado al host en `docker-compose.yml`**, pese a que la revisión de seguridad
+  del plan había recomendado no publicarlo (Meilisearch no tiene ningún cliente externo tipo
+  navegador, a diferencia de MinIO). Revertido en implementación: los tests de este proyecto corren
+  desde el host contra infraestructura real (`TEST_DATABASE_URL`/`REDIS_URL`/`S3_ENDPOINT_URL` ya
+  apuntan a `localhost` en `.env`, con sus puertos publicados por el mismo motivo), y
+  `tests/conftest.py` necesita alcanzar Meilisearch directo para `ensure_index_exists()` y limpiar
+  el índice entre tests. Mantener el puerto sin publicar rompía la suite completa (73 errores de
+  conexión) — la coherencia con "infraestructura real para cada test, nunca mocks" pesó más que el
+  endurecimiento de superficie de ataque, que de todos modos sigue protegido por la master key.
+- **CI sí puede usar el bloque declarativo `services:` para Meilisearch**, a diferencia de MinIO: la
+  imagen oficial arranca sin argumentos de comando obligatorios (la master key va por variable de
+  entorno), así que no hace falta el `docker run -d` manual que sí necesita MinIO (`command: server
+  /data`, no soportado por `services:`). El job `docker` también necesita
+  `MEILISEARCH_URL`/`MEILISEARCH_API_KEY` en su entorno pese a que su smoke test nunca ejercita
+  `/songs/search` — mismo bug de clase ya vivido con `S3_*` en la Fase 8: `Settings()` se valida al
+  importar `app.core.config`, y ese import ocurre en el `ENTRYPOINT` (`alembic upgrade head`) antes
+  de que `uvicorn` llegue a arrancar.
+- **Ajuste alineado en `GET /songs`**: gana `.where(Song.status == "ready")`, corrigiendo una
+  inconsistencia preexistente (antes listaba también canciones `"processing"`/`"failed"`, no
+  reproducibles). No introducida por esta fase, pero corregirla aquí evita que las dos vistas del
+  catálogo (`GET /songs` y `GET /songs/search`) muestren conjuntos distintos de canciones sin
+  explicación.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -828,6 +916,21 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   consumo vía `fetch()`/MediaSource sí lo exigiría, y hoy el bucket no tiene ninguna configuración
   de CORS. Ninguno de los dos se ha implementado — quedan fuera del alcance de esta fase (solo
   desarrollo local/Docker Compose), documentados aquí para no perderlos de vista.
+- **Canciones subidas antes de la Fase 10 no están indexadas** (Fase 10): sin backfill/script de
+  reindexación en el alcance actual — solo se indexan canciones que pasan por `upload_song` a
+  partir de esta fase. Quedarían invisibles a `GET /songs/search` (aunque sí siguen apareciendo en
+  `GET /songs`) hasta una reindexación manual futura.
+- **Sin reconciliación automática si la indexación falla** (Fase 10): si `index_song` falla (best
+  effort, ver Decisiones técnicas), no hay retry ni cola que reintente más tarde — la canción queda
+  reproducible pero invisible a la búsqueda hasta que exista una cola real (Celery, Fase 11), mismo
+  principio que las filas atascadas en `status="processing"` de la Fase 8.
+- **Meilisearch de un único nodo, sin réplica** (Fase 10): mismo riesgo ya aceptado para
+  Postgres/MinIO en fases anteriores — sin alta disponibilidad, aceptado para el alcance de un
+  proyecto de portfolio.
+- **Puerto 7700 publicado al host** (Fase 10): necesario para que los tests corran desde el host
+  contra infraestructura real (ver Decisiones técnicas) — protegido únicamente por la master key
+  (`MEILISEARCH_API_KEY`), sin capa de red adicional. Mismo nivel de exposición que Postgres/Redis/
+  MinIO, que ya publican sus puertos por el mismo motivo.
 
 ## Cómo escalaría esto en producción real
 

@@ -3,7 +3,7 @@
 #   - redis                   -> Fase 6 (standalone, para el rate limiter)
 #   - app                     -> Fase 7 (la API dockerizada; stack completo)
 #   - minio                   -> Fase 8 (almacenamiento de audio, compatible S3)
-#   - meilisearch              -> Fase 10
+#   - meilisearch              -> Fase 10 (búsqueda de canciones)
 # (Sin clave `version:` - está deprecada en Compose v2.)
 
 services:
@@ -66,6 +66,33 @@ services:
       timeout: 5s
       retries: 5
 
+  meilisearch:
+    image: getmeili/meilisearch:v1.53.1
+    restart: unless-stopped
+    environment:
+      # Resuelto desde .env, mismo mecanismo que MINIO_ROOT_USER/PASSWORD arriba.
+      MEILI_MASTER_KEY: ${MEILISEARCH_API_KEY}
+      MEILI_NO_ANALYTICS: "true"
+    # Publicado al host por el mismo motivo que postgres/redis/minio (no por un
+    # cliente externo tipo navegador, a diferencia de MinIO): los tests corren
+    # en el host contra infraestructura real (TEST_DATABASE_URL/REDIS_URL/
+    # S3_ENDPOINT_URL apuntan a localhost en .env), no dentro del contenedor
+    # "app" - conftest.py necesita alcanzar Meilisearch directo para
+    # ensure_index_exists()/limpiar el índice entre tests. La idea original del
+    # plan (no publicar, ver revisión de seguridad) resultó incompatible con
+    # "infraestructura real para cada test, nunca mocks" y se descartó en
+    # implementación tras romper la suite completa (73 errores de conexión).
+    ports:
+      - "7700:7700"
+    volumes:
+      - meilisearch_data:/meili_data
+    healthcheck:
+      # Verificado empíricamente: la imagen oficial SÍ trae curl (Alpine-based).
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   app:
     build: .
     restart: unless-stopped
@@ -77,6 +104,7 @@ services:
       DATABASE_URL: postgresql+psycopg://user:password@postgres:5432/spotify_clone
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
+      MEILISEARCH_URL: http://meilisearch:7700
       # Default real es True (config.py) - sobre HTTP local sin este override el
       # navegador/curl no reenvía la cookie Secure del refresh token.
       COOKIE_SECURE: "false"
@@ -89,6 +117,8 @@ services:
       redis:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      meilisearch:
         condition: service_healthy
     healthcheck:
       test:
@@ -110,3 +140,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  meilisearch_data:

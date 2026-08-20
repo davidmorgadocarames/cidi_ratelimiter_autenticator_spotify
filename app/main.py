@@ -10,6 +10,7 @@ from app.api.songs import router as songs_router
 from app.api.totp import router as totp_router
 from app.api.users import router as users_router
 from app.core.rate_limiter import RateLimitMiddleware
+from app.services.search import ensure_index_exists
 from app.services.storage import ensure_bucket_exists
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,19 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         logger.exception(
             "No se pudo verificar/crear el bucket de MinIO al arrancar - "
             "/songs fallará hasta que MinIO esté disponible"
+        )
+
+    # Try/except PROPIO, no compartido con el de MinIO de arriba (hallazgo de
+    # la revisión del plan): un fallo de Meilisearch debe loguearse con su
+    # propio mensaje, no el genérico de MinIO. Mismo principio fail-open: el
+    # resto de la API no depende de Meilisearch, solo /songs/search se vería
+    # afectado (con 503, ver app/api/songs.py), no la app entera.
+    try:
+        ensure_index_exists()
+    except Exception:
+        logger.exception(
+            "No se pudo verificar/crear el índice de Meilisearch al arrancar - "
+            "/songs/search fallará hasta que Meilisearch esté disponible"
         )
     yield
 

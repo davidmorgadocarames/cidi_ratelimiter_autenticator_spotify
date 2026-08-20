@@ -19,7 +19,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-9 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-10 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -28,9 +28,10 @@ GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11
 limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta, la API
 completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados con
 postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` + MinIO) con un
-catálogo público de canciones, y streaming real con Range Requests vía URLs firmadas de MinIO
-(control plane/data plane). Ver el roadmap completo abajo y el detalle de qué está implementado vs
-pendiente en [`docs/architecture.md`](docs/architecture.md).
+catálogo público de canciones, streaming real con Range Requests vía URLs firmadas de MinIO
+(control plane/data plane), y búsqueda de canciones por título/artista con Meilisearch. Ver el
+roadmap completo abajo y el detalle de qué está implementado vs pendiente en
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
@@ -156,6 +157,22 @@ backend-focused) — verificado con requests HTTP reales (`httpx`) contra la URL
 Range Requests reales y expiración real (no simulada). Decisiones y riesgos completos en
 [`docs/architecture.md`](docs/architecture.md).
 
+## Búsqueda (Fase 10)
+
+`GET /songs/search?q=...&limit=&offset=` busca por título/artista con [Meilisearch](https://www.meilisearch.com/),
+endpoint dedicado y separado de `GET /songs` (mismo principio de separación de responsabilidades ya
+aplicado a `storage.py`/`transcode.py`). Cada canción se indexa en cuanto termina de subirse y
+transcodificarse con éxito (`status="ready"`) — la indexación es **best-effort**: si Meilisearch
+falla o no responde, la subida sigue devolviendo `201` igual (MinIO/ffmpeg ya hicieron su trabajo,
+la canción es reproducible; la búsqueda es una capa derivada, no el núcleo de la funcionalidad,
+mismo principio de fail-open que Redis en la Fase 6). Al buscar, en cambio, un Meilisearch
+inalcanzable **sí** se refleja explícitamente: `503`, nunca una lista vacía engañosa. El endpoint
+construye la respuesta directamente desde los documentos que devuelve Meilisearch, sin volver a
+consultar Postgres (válido mientras no exista edición/borrado de canciones — ver
+`docs/architecture.md`). Canciones subidas *antes* de esta fase no quedan indexadas retroactivamente
+(sin backfill en el alcance actual). Decisiones completas en
+[`docs/architecture.md`](docs/architecture.md).
+
 ## Stack técnico (previsto)
 
 - **Backend**: Python 3 + FastAPI
@@ -193,10 +210,11 @@ Range Requests reales y expiración real (no simulada). Decisiones y riesgos com
 Requiere Python 3.13 en local (única versión instalada en esta máquina). El CI (Fase 5) corre
 además la suite completa contra 3.10/3.11/3.12 en GitHub Actions — verificado en verde en las
 tres, ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos). Requiere también
-Docker (para Postgres, adelantado a la Fase 1; Redis, adelantado a la Fase 6; y MinIO, Fase 8), y
-`ffmpeg`/`ffprobe` instalados en el sistema (Fase 8, subida/transcodificación de audio — **no** es
-un paquete pip, es un binario de sistema; en Windows: `winget install --id Gyan.FFmpeg -e`,
-verificar con `ffmpeg -version`; dentro de Docker ya viene instalado en la imagen, ver Dockerfile).
+Docker (para Postgres, adelantado a la Fase 1; Redis, adelantado a la Fase 6; MinIO, Fase 8; y
+Meilisearch, Fase 10), y `ffmpeg`/`ffprobe` instalados en el sistema (Fase 8,
+subida/transcodificación de audio — **no** es un paquete pip, es un binario de sistema; en
+Windows: `winget install --id Gyan.FFmpeg -e`, verificar con `ffmpeg -version`; dentro de Docker
+ya viene instalado en la imagen, ver Dockerfile).
 
 ```bash
 python -m venv .venv
@@ -221,13 +239,16 @@ un valor por defecto (`redis://localhost:6379/0`) sin validador de placeholder, 
 `JWT_SECRET_KEY` — pero hay que asegurarse de que apunte al Redis real que se levante.
 `S3_ACCESS_KEY`/`S3_SECRET_KEY` (Fase 8) sí tienen el mismo validador anti-`change-me` que
 `JWT_SECRET_KEY` — deben coincidir con `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` del servicio
-`minio` de `docker-compose.yml` (que los lee del propio `.env`, ver esa sección). El resto de
-variables se van sumando fase a fase.
+`minio` de `docker-compose.yml` (que los lee del propio `.env`, ver esa sección).
+`MEILISEARCH_API_KEY` (Fase 10) tiene el mismo validador anti-`change-me` y debe coincidir con
+`MEILI_MASTER_KEY` del servicio `meilisearch`, mismo mecanismo. El resto de variables se van
+sumando fase a fase.
 
-Levantar Postgres, Redis y MinIO, y aplicar las migraciones, antes de correr la API o los tests:
+Levantar Postgres, Redis, MinIO y Meilisearch, y aplicar las migraciones, antes de correr la API o
+los tests:
 
 ```bash
-docker compose up -d postgres redis minio
+docker compose up -d postgres redis minio meilisearch
 alembic upgrade head
 uvicorn app.main:app --reload
 # en otra terminal
@@ -246,7 +267,7 @@ placeholder `change-me`) — el `ENTRYPOINT` migra al arrancar y esa migración 
 a la vez, o el segundo falla con "address already in use".
 
 ```bash
-docker compose up -d --build   # postgres + redis + minio + la API, las 4 healthy antes de servir
+docker compose up -d --build   # postgres + redis + minio + meilisearch + la API, las 5 healthy antes de servir
 curl http://localhost:8000/health
 ```
 
