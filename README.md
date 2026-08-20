@@ -19,14 +19,16 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-6 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-7 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
 calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit), CI real en
-GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12), y rate
-limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta. Ver el
-roadmap completo abajo y el detalle de qué está implementado vs pendiente en
+GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12), rate
+limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta, y la API
+completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados con
+postgres/redis, smoke test en CI). Ver el roadmap completo abajo y el detalle de qué está
+implementado vs pendiente en
 [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
@@ -105,8 +107,9 @@ responde `429` con cabeceras `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-Rate
 
 **Por qué Redis y no un contador en memoria del proceso**: un diccionario Python en memoria solo
 sirve mientras haya un único proceso sirviendo requests. En cuanto la API corre con más de un
-worker de `uvicorn`/`gunicorn`, o más de una réplica del contenedor (lo normal en producción, y
-previsto para este proyecto en la Fase 7), cada proceso tendría su propio contador aislado — un
+worker de `uvicorn`/`gunicorn`, o más de una réplica del contenedor (lo normal en producción; la
+Fase 7 dockerizó la API pero con un único contenedor — réplicas reales detrás de un balanceador
+quedan para una fase futura, ver Fase 9/15), cada proceso tendría su propio contador aislado — un
 atacante repartiendo requests entre workers vería un límite efectivo multiplicado por el número de
 procesos, no el límite real. Redis centraliza el estado del bucket en un único lugar que todos los
 procesos comparten, independientemente de cuántos haya.
@@ -172,8 +175,8 @@ source .venv/bin/activate
 # Para desarrollo (ya incluye requirements.txt vía -r; añade pytest, httpx, pytest-cov,
 # ruff, black, mypy, pre-commit):
 pip install -r requirements-dev.txt
-# Si solo necesitas runtime (ej. lo que instalaría la imagen Docker de producción,
-# Fase 7), sin nada de lo anterior:
+# Si solo necesitas runtime (lo que instala la imagen Docker de producción,
+# Fase 7 - ver Dockerfile), sin nada de lo anterior:
 pip install -r requirements.txt
 ```
 
@@ -194,6 +197,31 @@ uvicorn app.main:app --reload
 # en otra terminal
 pytest tests/ -v
 ```
+
+### Todo en Docker (Fase 7)
+
+Alternativa al flujo de arriba, no su reemplazo — el venv local sigue siendo lo más rápido para
+iterar con `--reload`; esto sirve para probar el camino de despliegue real (imagen de producción)
+en vez del de desarrollo, o para no necesitar Python instalado en absoluto. Requiere el mismo
+`.env` con secretos reales de la sección anterior (`JWT_SECRET_KEY`/`TOTP_ENCRYPTION_KEY`, no el
+placeholder `change-me`) — el `ENTRYPOINT` migra al arrancar y esa migración ya importa
+`app.core.config`, que valida esos secretos aunque no los use directamente. **Nota**: el servicio
+`app` publica el puerto 8000, igual que `uvicorn --reload` en el flujo de arriba — no corras ambos
+a la vez, o el segundo falla con "address already in use".
+
+```bash
+docker compose up -d --build   # postgres + redis + la API, las 3 healthy antes de servir tráfico
+curl http://localhost:8000/health
+```
+
+La imagen (`Dockerfile`, multi-stage) instala solo `requirements.txt` — nunca
+`requirements-dev.txt` — corre como usuario no-root, y su `ENTRYPOINT`
+(`docker/entrypoint.sh`) aplica `alembic upgrade head` antes de arrancar `uvicorn`, así que no
+hace falta el paso manual de migraciones. `depends_on: condition: service_healthy` sobre
+postgres/redis significa que la API no arranca hasta que ambos estén realmente `healthy`, no solo
+iniciados. Detalle completo de las decisiones (por qué multi-stage, por qué el usuario no-root, el
+riesgo aceptado de migraciones automáticas con múltiples réplicas) en
+[`docs/architecture.md`](docs/architecture.md).
 
 Los tests corren contra una base de datos Postgres real y separada (`spotify_clone_test`, creada
 automáticamente por `docker/postgres-init/`), no contra SQLite ni con mocks.

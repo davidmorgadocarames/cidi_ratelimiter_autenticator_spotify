@@ -1,0 +1,4 @@
+# Los scripts de shell corren dentro de contenedores Linux - CRLF (autocrlf de Windows)
+# rompe el shebang/interprete con "$'\r': command not found". Forzar LF siempre,
+# independientemente de la config local de git del desarrollador.
+*.sh text eol=lf

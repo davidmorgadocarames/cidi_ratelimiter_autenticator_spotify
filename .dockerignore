@@ -1,0 +1,15 @@
+# Defensa en profundidad: el Dockerfile ya copia solo app/ y alembic.ini de forma explicita
+# (nunca "COPY . ."), pero esto evita que .env real (u otros archivos sensibles/pesados) se
+# envien siquiera al build context del daemon si el Dockerfile cambia en el futuro.
+.venv/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+htmlcov/
+.coverage
+tests/
+docs/
