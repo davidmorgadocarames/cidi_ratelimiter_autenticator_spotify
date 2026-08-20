@@ -313,6 +313,49 @@ activarse porque el fallo ocurría ANTES, al instanciar `Settings()`, no al llam
 credenciales S3 válidas, endpoint inalcanzable) antes de repushear: el contenedor arranca
 `healthy` y `/health` responde `200`, con el warning de fail-open esperado en los logs.
 
+**Fase 9 — Streaming de audio (Range Requests, control plane vs data plane).** Cierra el hueco que
+la Fase 8 dejó a propósito: nuevo endpoint `GET /songs/{id}/stream` que no sirve audio, devuelve
+una URL de MinIO firmada temporalmente (`app/services/storage.py`, `generate_presigned_url` +
+`SongStreamURL` en `app/schemas/song.py`). Diseño control plane / data plane, tal como ya
+prometía el README desde la Fase 0: FastAPI (control plane) solo autoriza
+(`Authorization: Bearer` obligatorio, mismo `get_current_user` que el resto de `/songs`, catálogo
+público — cualquier usuario autenticado puede pedir el stream de cualquier canción) y firma; MinIO
+(data plane) sirve los bytes directo con Range Requests nativo, sin que la API tenga que
+reimplementar `Content-Range`/`206 Partial Content`. Siempre firma `transcoded_object_key`, nunca
+`original_object_key` (que tiene un content-type no controlado declarado por el uploader) — la key
+nunca la aporta el cliente, siempre sale server-side de la fila `Song`. `404` si la canción no
+existe, `409` si `status` es `"processing"` o `"failed"`, `500` (chequeo explícito, no un `assert`
+— defensa real y necesaria para que `mypy --strict` estreche `str | None` a `str`) si por algún
+fallo imprevisto `transcoded_object_key` fuera `None` pese a `status="ready"`.
+
+Nuevo cliente `boto3` separado (`_public_client` en `app/services/storage.py`), firmando contra
+`s3_public_endpoint_url` (nueva variable de config, sin validador anti-`change-me` — no es un
+secreto) en vez de `s3_endpoint_url` — el primero es el que debe poder resolver el navegador del
+cliente (`http://localhost:9000` tanto en venv local como en `docker compose up --build`, ver
+Decisiones técnicas), el segundo es el hostname interno de Docker (`minio:9000`) que usa la app
+para hablar con MinIO servidor-a-servidor. Verificado end-to-end contra ambos caminos (proceso
+local y stack dockerizado completo): en ambos casos la URL firmada apunta correctamente a
+`localhost:9000`, resoluble por `curl`/navegador desde el host, y `curl -r 0-1000 <url>` devuelve
+`206 Partial Content` real con `Content-Range` correcto.
+
+**Corrección empírica durante la implementación**: el plan de esta fase asumía firma SigV4 en
+varios puntos de su razonamiento (justificación de `region_name`, terminología general). La URL
+real generada por `boto3.generate_presigned_url` contra MinIO usa el formato clásico de
+query-string auth (`?AWSAccessKeyId=...&Signature=...&Expires=...`), que es **SigV2**, no SigV4 —
+boto3 no fuerza `SigV4` para un `endpoint_url` custom salvo que se configure explícitamente
+`Config(signature_version="s3v4")`, cosa que este plan no hacía. Funciona igual (verificado con
+`curl` real, tanto la request completa como el `Range`), así que no se ha forzado SigV4 —
+documentado aquí como corrección del razonamiento original, no como bug: el `region_name`
+explícito añadido en la revisión del plan sigue siendo inofensivo aunque SigV2 no lo use.
+
+7 tests nuevos en `tests/test_songs.py`: éxito con verificación de `Content-Range` real vía
+`httpx.get()` directo contra la URL firmada (no `TestClient`, no mocks — una request HTTP de
+verdad contra MinIO), `409` para `"processing"`/`"failed"` (filas creadas directo vía `db_session`,
+sin pasar por el pipeline de subida), `404`, `401`, catálogo público (usuario B pide con éxito el
+stream de una canción de A), y expiración real (`expires_in=1` + `time.sleep(2)` reales — el TTL
+de una firma lo valida el reloj de MinIO server-side, no hay timestamp en Postgres/Redis que
+manipular como en fases anteriores).
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -334,7 +377,7 @@ proyecto de portfolio).
 | 6    | Rate limiter con Redis                    | ✅ Implementado |
 | 7    | Contenedores                              | ✅ Implementado |
 | 8    | Subida y transcodificación de audio       | ✅ Implementado |
-| 9    | Streaming de audio                        | ⬜ Pendiente    |
+| 9    | Streaming de audio                        | ✅ Implementado |
 | 10   | Búsqueda                                  | ⬜ Pendiente    |
 | 11   | Recomendaciones precalculadas (Celery)    | ⬜ Pendiente    |
 | 12   | Caché de contenido popular                | ⬜ Pendiente    |
@@ -645,7 +688,47 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   requerida, no opcional.
 - **Sin `DELETE`/sin presigned URL en esta fase**: decisión explícita del usuario para mantener el
   alcance de esta fase ceñido a "subir y transcodificar" — servir/descargar el audio es
-  explícitamente Fase 9 (Range Requests, streaming real).
+  explícitamente Fase 9 (Range Requests, streaming real). **Presigned URL implementada en Fase 9**;
+  `DELETE` sigue sin existir (no era parte del alcance de Fase 9 tampoco).
+
+**Fase 9 — Streaming de audio**
+
+- **Presigned URL de MinIO en vez de proxyear bytes por FastAPI**: MinIO (compatible S3) ya
+  soporta `Range` de forma nativa; proxyear exigiría leer `Range` a mano, llamar a
+  `get_object(Range=...)` de boto3, envolver el `StreamingBody` en un `StreamingResponse` propio, y
+  replicar `Content-Range`/`206` — trabajo real sin beneficio dado que MinIO ya lo resuelve.
+- **Por qué JSON y no un `302` directo a la URL firmada**: el propio endpoint que emite la URL
+  exige `Authorization: Bearer`, y un `<audio src="...">` HTML nativo no puede mandar ese header —
+  un `302` sería literalmente inalcanzable si se apuntara un `<audio src>` directo a
+  `/songs/{id}/stream`. El flujo real (aunque esta fase no incluya la UI que lo consuma) es JS
+  haciendo `fetch()` autenticado, recibiendo el JSON, y solo entonces asignando `audio.src = url` —
+  la URL ya lleva su propia autorización embebida (firma), así que a partir de ahí funciona sin
+  headers especiales.
+- **Expiración de 15 minutos**: generoso para escuchar/rebobinar una canción de pocos minutos sin
+  que expire a mitad, acota razonablemente la ventana de exposición si la URL se filtrara. Sin
+  mecanismo de revocación manual (no existe en S3/MinIO sin IAM más complejo) — aceptado.
+- **`s3_public_endpoint_url` separado de `s3_endpoint_url`**: dentro de `docker-compose.yml`, el
+  contenedor `app` habla con MinIO por el hostname interno `minio:9000` para operaciones
+  servidor-a-servidor — pero ese hostname no es resoluble desde el navegador del cliente. El
+  endpoint "público" no se sobreescribe en compose (se queda con el default `http://localhost:9000`
+  de `.env`), correcto tanto si la app corre en Docker como en venv local, porque en ambos casos el
+  navegador está en el mismo host — verificado empíricamente contra ambos caminos (ver Resumen).
+- **`region_name="us-east-1"` explícito en ambos clientes `boto3`**: antes se dejaba a la
+  resolución implícita del SDK (funcionaba, pero dependía del entorno). Resultó no ser
+  estrictamente necesario para la firma real generada (ver la corrección sobre SigV2 vs SigV4 en el
+  Resumen), pero es inofensivo y hace el comportamiento determinista independientemente de
+  variables `AWS_*` presentes o ausentes en el entorno — se mantiene.
+- **Siempre se firma `transcoded_object_key`, nunca `original_object_key`**: el original tiene un
+  content-type no controlado (declarado por el uploader); ningún endpoint acepta una key arbitraria
+  del cliente para firmar, siempre sale server-side de la fila `Song` ya persistida.
+- **Bucket sigue privado**: el segundo cliente `boto3` (`_public_client`) solo cambia el
+  `endpoint_url` de firma — ningún cambio de política de acceso del bucket ni ACLs. "Público" en
+  los nombres (`_public_client`, `s3_public_endpoint_url`) se refiere a *alcanzabilidad de red*
+  (qué host puede resolver el navegador), no a hacer el bucket públicamente accesible sin firma.
+- **El endpoint que emite URLs firmadas comparte el tier `general` del rate limiter (60/min)**, sin
+  tier propio — suficiente para el alcance de portfolio; un usuario podría en teoría generar
+  enlaces de descarga de todo el catálogo en bucle, mitigado porque los metadatos ya son públicos
+  de todos modos y cada URL expira en 15 minutos.
 
 ## Riesgos conocidos
 
@@ -723,6 +806,28 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **Sin límite acumulado de almacenamiento/subidas por usuario** (Fase 8): el límite es solo por
   request (20MB); combinado con el rate limiter general (60/min), un usuario podría subir hasta
   ~1.2GB/minuto de forma sostenida. Aceptado para el alcance de portfolio.
+- **URL de streaming filtrada = acceso a los bytes de audio sin ninguna sesión durante 15 min**
+  (Fase 9): a diferencia del catálogo público (que exige `Authorization: Bearer` en cada request),
+  una URL SigV2/SigV4 lleva la autorización *en la propia URL* — quien la consiga (compartida,
+  capturada en logs de un proxy/analytics de terceros, historial de navegador) puede reproducir el
+  audio sin sesión mientras no expire. Salto real, aunque acotado (15 min, sin alcance) y aceptado.
+- **Sin revocación manual de URLs firmadas ya emitidas** (Fase 9): no existe ese mecanismo en
+  S3/MinIO sin IAM/políticas más complejas — mitigado solo por la expiración corta.
+- **Endpoint de streaming sin tier de rate limit propio** (Fase 9): comparte el tier `general`
+  (60/min) del resto de `/songs` — un usuario podría generar enlaces de descarga de todo el
+  catálogo en bucle. Mitigado parcialmente (metadatos ya públicos, URLs expiran rápido), no
+  eliminado.
+- **`s3_public_endpoint_url` asume que el navegador del cliente y el servidor comparten host**
+  (Fase 9): correcto para el alcance actual (desarrollo local, `docker compose up`), pero un
+  despliegue real en una red distinta (ej. servidor remoto, dominio público) necesitaría más que
+  solo fijar esa variable al hostname público (hallazgo de la revisión post-implementación,
+  encontrado por el abogado del diablo): (a) **HTTPS/mixed-content** — si el frontend se sirve por
+  HTTPS, el navegador bloquearía cargar `audio.src` desde una presigned URL `http://`, y la propia
+  firma va ligada al scheme+host exactos, así que MinIO tendría que servir por HTTPS también; (b)
+  **CORS del bucket** — un `<audio src>` plano no necesita CORS para reproducir, pero cualquier
+  consumo vía `fetch()`/MediaSource sí lo exigiría, y hoy el bucket no tiene ninguna configuración
+  de CORS. Ninguno de los dos se ha implementado — quedan fuera del alcance de esta fase (solo
+  desarrollo local/Docker Compose), documentados aquí para no perderlos de vista.
 
 ## Cómo escalaría esto en producción real
 

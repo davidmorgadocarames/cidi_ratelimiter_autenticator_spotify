@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,9 +11,12 @@ from botocore.exceptions import ClientError
 from fastapi import UploadFile
 from fastapi.testclient import TestClient
 from mypy_boto3_s3.client import S3Client
+from sqlalchemy.orm import Session
 
 from app.api.songs import _MAX_UPLOAD_BYTES, _read_upload_to_tempfile
 from app.core.config import settings
+from app.models.song import Song
+from app.services import storage
 
 PASSWORD = "supersecret"
 
@@ -227,3 +231,119 @@ def test_read_upload_to_tempfile_enforces_limit_via_chunked_read() -> None:
     with pytest.raises(Exception) as exc_info:
         _read_upload_to_tempfile(fake_file)
     assert getattr(exc_info.value, "status_code", None) == 413
+
+
+def _create_song_directly(
+    db_session: Session, uploaded_by_id: int, status_value: str
+) -> Song:
+    """Crea una fila Song sin pasar por el pipeline de subida - para probar
+    los estados "processing"/"failed" del endpoint de streaming sin depender
+    de mockear ffmpeg. NOT NULL en original_object_key/content_type/
+    file_size_bytes, así que hay que rellenarlos igual con valores dummy."""
+    song = Song(
+        title="Canción de prueba",
+        artist="Artista de prueba",
+        uploaded_by_id=uploaded_by_id,
+        status=status_value,
+        original_object_key="original/999999/source",
+        content_type="audio/mpeg",
+        file_size_bytes=123,
+    )
+    db_session.add(song)
+    db_session.commit()
+    db_session.refresh(song)
+    return song
+
+
+def test_stream_url_returns_presigned_url_with_range_support(
+    client: TestClient, sample_audio_file: Path
+) -> None:
+    token = _register_and_login(client, "streamer@example.com")
+    upload_response = _upload(client, token, sample_audio_file)
+    song_id = upload_response.json()["id"]
+
+    stream_response = client.get(f"/songs/{song_id}/stream", headers=_headers(token))
+    assert stream_response.status_code == 200
+    body = stream_response.json()
+    assert body["expires_in"] == 900
+    url = body["url"]
+
+    # Request HTTP real y directa contra la URL firmada (no vía TestClient,
+    # no vía la app - directo contra MinIO), confirmando que Range Requests
+    # funcionan de verdad, no solo que la URL se generó con buena pinta.
+    full = httpx.get(url)
+    assert full.status_code == 200
+    total_bytes = len(full.content)
+
+    partial = httpx.get(url, headers={"Range": "bytes=0-100"})
+    assert partial.status_code == 206
+    assert partial.headers["content-range"] == f"bytes 0-100/{total_bytes}"
+    assert len(partial.content) == 101
+
+
+def test_stream_url_rejects_processing_song(
+    client: TestClient, db_session: Session
+) -> None:
+    token = _register_and_login(client, "streamprocessing@example.com")
+    me = client.get("/auth/me", headers=_headers(token)).json()
+    song = _create_song_directly(db_session, me["id"], "processing")
+
+    response = client.get(f"/songs/{song.id}/stream", headers=_headers(token))
+    assert response.status_code == 409
+
+
+def test_stream_url_rejects_failed_song(
+    client: TestClient, db_session: Session
+) -> None:
+    token = _register_and_login(client, "streamfailed@example.com")
+    me = client.get("/auth/me", headers=_headers(token)).json()
+    song = _create_song_directly(db_session, me["id"], "failed")
+
+    response = client.get(f"/songs/{song.id}/stream", headers=_headers(token))
+    assert response.status_code == 409
+
+
+def test_stream_url_404_for_nonexistent_song(client: TestClient) -> None:
+    token = _register_and_login(client, "streamnotfound@example.com")
+    response = client.get("/songs/999999/stream", headers=_headers(token))
+    assert response.status_code == 404
+
+
+def test_stream_url_requires_auth(client: TestClient) -> None:
+    response = client.get("/songs/1/stream")
+    assert response.status_code == 401
+
+
+def test_stream_url_available_to_any_authenticated_user(
+    client: TestClient, sample_audio_file: Path
+) -> None:
+    token_a = _register_and_login(client, "stream-a@example.com")
+    token_b = _register_and_login(client, "stream-b@example.com")
+
+    upload_response = _upload(client, token_a, sample_audio_file)
+    song_id = upload_response.json()["id"]
+
+    # B, que no subió nada, puede pedir con éxito la URL de streaming de la
+    # canción de A - mismo patrón de catálogo público que la lectura de
+    # metadatos (Fase 8).
+    response = client.get(f"/songs/{song_id}/stream", headers=_headers(token_b))
+    assert response.status_code == 200
+
+
+def test_presigned_url_expires_after_ttl(
+    client: TestClient, sample_audio_file: Path
+) -> None:
+    """Expiración real, no simulada: el TTL de una firma SigV4 lo valida el
+    reloj de MinIO server-side, no hay ningún timestamp en Postgres/Redis que
+    manipular como en fases anteriores - la única forma de probarlo es dejar
+    pasar tiempo de verdad."""
+    token = _register_and_login(client, "expiry@example.com")
+    upload_response = _upload(client, token, sample_audio_file)
+    song_id = upload_response.json()["id"]
+    transcoded_key = f"transcoded/{song_id}.mp3"
+
+    short_lived_url = storage.generate_presigned_url(transcoded_key, expires_in=1)
+    time.sleep(2)
+
+    response = httpx.get(short_lived_url)
+    assert response.status_code >= 400

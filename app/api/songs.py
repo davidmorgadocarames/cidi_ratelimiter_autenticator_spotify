@@ -20,7 +20,7 @@ from app.api.auth import get_current_user
 from app.db.session import get_db
 from app.models.song import Song
 from app.models.user import User
-from app.schemas.song import SongRead
+from app.schemas.song import SongRead, SongStreamURL
 from app.services import storage
 from app.services.transcode import (
     TranscodeError,
@@ -48,6 +48,15 @@ _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 _CHUNK_SIZE = 1024 * 1024
 
 _GENERIC_FAILURE_MESSAGE = "No se pudo procesar el archivo de audio."
+
+# 15 minutos: generoso para escuchar/rebobinar una canción de pocos minutos
+# sin que la URL expire a mitad, pero acota razonablemente la ventana de
+# exposición si la URL firmada se filtrara (queda en logs de red, historial
+# del navegador, etc. - una URL firmada (SigV2 en la práctica, ver
+# app/services/storage.py) lleva la autorización EN la propia URL, así que
+# cualquiera que la consiga puede reproducir el audio sin sesión durante ese
+# tiempo, ver docs/architecture.md).
+_STREAM_URL_EXPIRES_IN_SECONDS = 900
 
 
 def _reject_if_content_length_too_large(request: Request) -> None:
@@ -201,3 +210,51 @@ def get_song(
             status_code=status.HTTP_404_NOT_FOUND, detail="Canción no encontrada"
         )
     return song
+
+
+@router.get("/{song_id}/stream", response_model=SongStreamURL)
+def get_song_stream_url(
+    song_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SongStreamURL:
+    """Control plane: solo devuelve una URL firmada, nunca los bytes de audio
+    (data plane, servidos directo por MinIO - ver docs/architecture.md). El
+    cliente real (un <audio src>, curl, etc.) hace la request de streaming
+    contra esa URL, no contra este endpoint - JSON, no un 302 directo, porque
+    este endpoint SÍ exige Authorization: Bearer y un <audio> nativo no puede
+    mandar ese header; la URL firmada, en cambio, ya lleva su propia
+    autorización embebida y no necesita ninguno."""
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Canción no encontrada"
+        )
+    if song.status != "ready":
+        # Whitelist ("!= ready"), no blacklist ("== processing or == failed"):
+        # "status" es un str libre a nivel de columna, sin CHECK/enum, y
+        # "pending" está reservado para cuando exista una cola real (Fase 11)
+        # - con una blacklist, un valor futuro no contemplado caería
+        # silenciosamente en el chequeo de transcoded_object_key de abajo en
+        # vez de dar el 409 correcto (hallazgo de la revisión post-implementación).
+        detail = (
+            "Todavía se está procesando"
+            if song.status == "processing"
+            else "El procesamiento de esta canción falló"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
+    if song.transcoded_object_key is None:
+        # No debería poder pasar nunca en la práctica (status="ready" siempre
+        # implica transcoded_object_key ya fijado, ver upload_song arriba),
+        # pero el campo es str | None a nivel de tipo y el guard de status no
+        # lo estrecha para mypy --strict - este chequeo explícito satisface
+        # el type-checker Y es una defensa real, no solo cosmética.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error interno: la canción no tiene un archivo transcodificado",
+        )
+
+    url = storage.generate_presigned_url(
+        song.transcoded_object_key, expires_in=_STREAM_URL_EXPIRES_IN_SECONDS
+    )
+    return SongStreamURL(url=url, expires_in=_STREAM_URL_EXPIRES_IN_SECONDS)

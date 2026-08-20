@@ -19,7 +19,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-8 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-9 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -27,10 +27,10 @@ calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-c
 GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12), rate
 limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta, la API
 completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados con
-postgres/redis, smoke test en CI), y subida/transcodificación de audio (`ffmpeg` + MinIO) con un
-catálogo público de canciones. Ver el roadmap completo abajo y el detalle de qué está
-implementado vs pendiente en
-[`docs/architecture.md`](docs/architecture.md).
+postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` + MinIO) con un
+catálogo público de canciones, y streaming real con Range Requests vía URLs firmadas de MinIO
+(control plane/data plane). Ver el roadmap completo abajo y el detalle de qué está implementado vs
+pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
@@ -136,10 +136,25 @@ transcodificado en MinIO (compatible S3, vía `boto3`). Todo síncrono dentro de
 sin cola de tareas todavía (Celery es Fase 11) — así que una subida grande mantiene ocupado un
 hilo del servidor mientras dura. `GET /songs`/`GET /songs/{id}` exponen el catálogo, público para
 cualquier usuario autenticado (no solo el que subió cada canción) — más fiel a un clon real de
-Spotify que un catálogo privado por usuario. Sin URL de descarga todavía ni endpoint de borrado —
-eso y el streaming real (Range Requests) son Fase 9. Decisiones completas, límites (20MB por
-archivo) y riesgos aceptados (agotamiento del threadpool compartido bajo subidas concurrentes,
-filas atascadas si el proceso muere a mitad) en [`docs/architecture.md`](docs/architecture.md).
+Spotify que un catálogo privado por usuario. Sin endpoint de borrado — ver Fase 9 abajo para cómo
+se sirve el audio de verdad. Decisiones completas, límites (20MB por archivo) y riesgos aceptados
+(agotamiento del threadpool compartido bajo subidas concurrentes, filas atascadas si el proceso
+muere a mitad) en [`docs/architecture.md`](docs/architecture.md).
+
+## Streaming de audio (Fase 9)
+
+`GET /songs/{id}/stream` no sirve audio directamente — devuelve una URL de MinIO firmada
+(SigV2/SigV4 según el endpoint, ver `docs/architecture.md`) válida 15 minutos. Es el "control
+plane" de la separación que promete el roadmap: FastAPI solo autoriza (`Authorization: Bearer`
+obligatorio) y firma; MinIO ("data plane") sirve los bytes directo, con soporte nativo de Range
+Requests (`206 Partial Content`) sin que la API tenga que reimplementarlo. Un `<audio src="...">`
+HTML no puede mandar headers custom, así que la URL YA lleva su propia autorización embebida — el
+flujo real es JS pidiendo la URL con `fetch()` autenticado y luego asignándola a `audio.src`, sin
+que el streaming en sí pase nunca por el rate limiter ni por FastAPI. Siempre se firma el
+transcodificado, nunca el original. Sin UI de reproducción en esta fase (decisión explícita,
+backend-focused) — verificado con requests HTTP reales (`httpx`) contra la URL firmada, incluyendo
+Range Requests reales y expiración real (no simulada). Decisiones y riesgos completos en
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Stack técnico (previsto)
 

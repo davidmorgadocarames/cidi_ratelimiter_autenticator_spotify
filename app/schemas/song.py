@@ -16,3 +16,8 @@ class SongRead(BaseModel):
     file_size_bytes: int
     error_message: str | None
     created_at: datetime
+
+
+class SongStreamURL(BaseModel):
+    url: str
+    expires_in: int

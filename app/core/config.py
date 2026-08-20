@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     s3_access_key: str = "change-me"
     s3_secret_key: str = "change-me"
     s3_bucket_name: str = "songs"
+    # Endpoint que debe poder resolver el NAVEGADOR del cliente para consumir
+    # una presigned URL (Fase 9) - distinto de s3_endpoint_url, que dentro de
+    # docker-compose.yml se sobreescribe al hostname interno "minio:9000"
+    # (no resoluble desde fuera del contenedor). No es un secreto, sin
+    # validador anti-"change-me".
+    s3_public_endpoint_url: str = "http://localhost:9000"
 
     @field_validator("jwt_secret_key")
     @classmethod
