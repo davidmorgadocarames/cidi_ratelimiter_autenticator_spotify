@@ -9,6 +9,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
     status,
@@ -21,7 +22,7 @@ from app.db.session import get_db
 from app.models.song import Song
 from app.models.user import User
 from app.schemas.song import SongRead, SongStreamURL
-from app.services import storage
+from app.services import search, storage
 from app.services.transcode import (
     TranscodeError,
     probe_duration_seconds,
@@ -177,6 +178,29 @@ def upload_song(
             db.commit()
             db.refresh(song)
 
+        # FUERA del try/except de arriba, a propósito (hallazgo de la revisión
+        # del plan): ese try/except es el manejo BLOQUEANTE de MinIO/ffmpeg
+        # (marca "failed" y borra objetos si algo de eso revienta). Indexar en
+        # Meilisearch es best-effort (ver app/services/search.py) - un fallo
+        # ahí no debe poder marcar "failed" ni borrar objetos de una canción
+        # que SÍ es reproducible. Solo se llama si terminó "ready".
+        #
+        # try/except propio aquí, en defensa en profundidad (mismo principio
+        # que index_song no confiando ciegamente en su llamador): index_song
+        # ya nunca propaga por diseño, pero esta subida no debe depender de
+        # que esa garantía se mantenga siempre (ni de que un test doble no la
+        # reproduzca fielmente).
+        if song.status == "ready":
+            try:
+                search.index_song(song)
+            except Exception:
+                logger.exception(
+                    "search.index_song lanzó una excepción inesperada para la "
+                    "canción %s (no debería propagar) - se ignora, la subida "
+                    "sigue siendo válida",
+                    song.id,
+                )
+
         return song
     finally:
         Path(original_path).unlink(missing_ok=True)
@@ -186,16 +210,56 @@ def upload_song(
 
 @router.get("", response_model=list[SongRead])
 def list_songs(
-    limit: int = 50,
-    offset: int = 0,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> list[Song]:
+    # Solo "ready": ajuste alineado con la Fase 10 (hasta ahora listaba TODAS
+    # las canciones sin filtrar, incluyendo "processing"/"failed", que no son
+    # reproducibles) - sin esto, este listado mostraría canciones que
+    # GET /songs/search nunca podría encontrar (solo se indexan las "ready"),
+    # una discrepancia confusa entre las dos vistas del mismo catálogo.
     return list(
         db.scalars(
-            select(Song).order_by(Song.created_at.desc()).limit(limit).offset(offset)
+            select(Song)
+            .where(Song.status == "ready")
+            .order_by(Song.created_at.desc())
+            .limit(limit)
+            .offset(offset)
         )
     )
+
+
+@router.get("/search", response_model=list[SongRead])
+def search_songs_endpoint(
+    q: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: User = Depends(get_current_user),
+) -> list[SongRead]:
+    """Registrado ANTES de /{song_id} a propósito, no por casualidad: FastAPI/
+    Starlette resuelve rutas en el orden en que se registran, y /{song_id} es
+    un regex de segmento genérico - la validación de que song_id sea int
+    ocurre DESPUÉS de que la ruta ya haya hecho match, no como parte del
+    patrón de la URL. Si /{song_id} se registrara antes, una request a
+    /songs/search matchearía esa ruta con song_id="search" y fallaría con 422
+    en vez de llegar aquí.
+
+    limit/offset acotados con Query(ge=..., le=...) - sin esto, un valor
+    negativo llegaría crudo a Meilisearch, que respondería 400, y este except
+    lo convertiría en un 503 engañoso ("buscador caído") en vez de un 422 de
+    validación de entrada (hallazgo de la revisión post-implementación,
+    confirmado por los tres revisores)."""
+    try:
+        hits = search.search_songs(q, limit=limit, offset=offset)
+        return [SongRead(**hit) for hit in hits]
+    except Exception as exc:
+        logger.exception("Meilisearch no respondió a una búsqueda")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="El buscador no está disponible en este momento",
+        ) from exc
 
 
 @router.get("/{song_id}", response_model=SongRead)

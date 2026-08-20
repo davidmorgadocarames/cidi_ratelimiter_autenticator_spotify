@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # validador anti-"change-me".
     s3_public_endpoint_url: str = "http://localhost:9000"
 
+    meilisearch_url: str = "http://localhost:7700"
+    meilisearch_api_key: str = "change-me"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:
@@ -72,6 +75,17 @@ class Settings(BaseSettings):
                 "S3_ACCESS_KEY/S3_SECRET_KEY siguen en el valor placeholder "
                 "'change-me'. Pon las credenciales reales de MinIO en .env "
                 "(MINIO_ROOT_USER/MINIO_ROOT_PASSWORD del servicio minio)."
+            )
+        return value
+
+    @field_validator("meilisearch_api_key")
+    @classmethod
+    def _reject_placeholder_meilisearch_key(cls, value: str) -> str:
+        if value == "change-me":
+            raise ValueError(
+                "MEILISEARCH_API_KEY sigue en el valor placeholder 'change-me'. "
+                "Pon la master key real de Meilisearch en .env "
+                "(MEILI_MASTER_KEY del servicio meilisearch)."
             )
         return value
 

@@ -8,6 +8,7 @@ import boto3
 import pytest
 import redis as redis_sync
 from fastapi.testclient import TestClient
+from meilisearch import Client as MeilisearchClient
 from mypy_boto3_s3.client import S3Client
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
@@ -16,6 +17,7 @@ from app.core.config import settings
 from app.db.session import Base, get_db
 from app.main import app
 from app.models import song, user  # noqa: F401 - registra los modelos en Base.metadata
+from app.services.search import _INDEX_NAME, ensure_index_exists
 from app.services.storage import ensure_bucket_exists
 
 test_engine = create_engine(settings.test_database_url)
@@ -34,6 +36,12 @@ test_s3: S3Client = boto3.client(
     endpoint_url=settings.s3_endpoint_url,
     aws_access_key_id=settings.s3_access_key,
     aws_secret_access_key=settings.s3_secret_key,
+)
+
+# Cliente Meilisearch de test para manipular/verificar el índice directamente
+# (mismo patrón que test_redis/test_s3: conexión separada de la que usa la app).
+test_meilisearch = MeilisearchClient(
+    settings.meilisearch_url, settings.meilisearch_api_key, timeout=5
 )
 
 
@@ -66,6 +74,24 @@ def _clean_bucket() -> Generator[None, None, None]:
             Bucket=settings.s3_bucket_name,
             Delete={"Objects": [{"Key": obj["Key"]} for obj in objects]},
         )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_test_index() -> None:
+    # Una sola vez por sesión, mismo motivo que _ensure_test_bucket - no
+    # depende del lifespan de la app real, que no se dispara en tests.
+    ensure_index_exists()
+
+
+@pytest.fixture(autouse=True)
+def _clean_index() -> Generator[None, None, None]:
+    """Vacía el índice de Meilisearch entre tests, mismo patrón que
+    _clean_bucket/_flush_redis. Espera la task antes de continuar, para que
+    el índice quede realmente vacío antes de que empiece el siguiente test."""
+    yield
+    index = test_meilisearch.index(_INDEX_NAME)
+    task_info = index.delete_all_documents()
+    test_meilisearch.wait_for_task(task_info.task_uid)
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +152,14 @@ def s3_client() -> S3Client:
     """Cliente boto3 directo, para verificar objetos subidos a MinIO desde
     los tests (head_object, download_file para re-validar con ffprobe)."""
     return test_s3
+
+
+@pytest.fixture()
+def meilisearch_client() -> MeilisearchClient:
+    """Cliente Meilisearch directo, para inspeccionar el índice desde los
+    tests (ej. forzar un documento con status distinto de "ready" para
+    probar el filtro de index_song sin pasar por el pipeline completo)."""
+    return test_meilisearch
 
 
 @pytest.fixture()

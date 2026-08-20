@@ -42,6 +42,23 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      meilisearch:
+        # A diferencia de MinIO (más abajo, "Start MinIO"), la imagen oficial
+        # arranca sin argumentos de comando obligatorios (la master key va por
+        # variable de entorno) - sí puede usar el bloque declarativo
+        # "services:", igual que postgres/redis. Verificado empíricamente que
+        # la imagen trae curl (Alpine-based, ver docker-compose.yml).
+        image: getmeili/meilisearch:v1.53.1
+        env:
+          MEILI_MASTER_KEY: ci-meilisearch-master-key-not-a-real-secret
+          MEILI_NO_ANALYTICS: "true"
+        ports:
+          - 7700:7700
+        options: >-
+          --health-cmd "curl -f http://localhost:7700/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       DATABASE_URL: postgresql+psycopg://user:password@localhost:5432/spotify_clone
@@ -59,6 +76,10 @@ jobs:
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin123
       S3_BUCKET_NAME: songs
+      # Mismo valor que MEILI_MASTER_KEY del servicio "meilisearch" de arriba -
+      # no es un secreto real (igual que las credenciales de MinIO), solo-CI.
+      MEILISEARCH_URL: http://localhost:7700
+      MEILISEARCH_API_KEY: ci-meilisearch-master-key-not-a-real-secret
 
     steps:
       - uses: actions/checkout@v4
@@ -158,6 +179,13 @@ jobs:
       DATABASE_URL: postgresql+psycopg://user:password@localhost:5432/spotify_clone
       REDIS_URL: redis://localhost:6379/0
       COOKIE_SECURE: "false"
+      # Este job no levanta Meilisearch real, pero necesita valores que pasen
+      # el validador anti-"change-me" de Settings - la importación de
+      # app.core.config ocurre en el ENTRYPOINT (alembic upgrade head) antes
+      # de que uvicorn arranque, aunque el smoke test de abajo nunca toque
+      # /songs/search (mismo motivo que S3_* justo debajo).
+      MEILISEARCH_URL: http://localhost:7700
+      MEILISEARCH_API_KEY: ci-meilisearch-master-key-not-a-real-secret
       JWT_SECRET_KEY: ${{ secrets.CI_JWT_SECRET_KEY }}
       TOTP_ENCRYPTION_KEY: ${{ secrets.CI_TOTP_ENCRYPTION_KEY }}
       # Este job no levanta MinIO (solo hace smoke-test de /health, no de
@@ -196,6 +224,8 @@ jobs:
             -e S3_ACCESS_KEY \
             -e S3_SECRET_KEY \
             -e S3_BUCKET_NAME \
+            -e MEILISEARCH_URL \
+            -e MEILISEARCH_API_KEY \
             cidi-api:ci
 
           ok=""

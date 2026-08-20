@@ -23,3 +23,7 @@ redis==5.2.0
 # instalado aparte como binario de sistema - no es un paquete pip; MinIO/S3
 # vía boto3)
 boto3==1.43.75
+
+# Fase 10: búsqueda (Meilisearch) - cliente oficial, publica py.typed (no
+# hace falta ningún paquete de stubs ni override de mypy)
+meilisearch==0.43.0
