@@ -1,6 +1,7 @@
 # Servicios adelantados fase a fase (ver docs/architecture.md):
-#   - postgres                -> Fase 1 (adelantado; el resto del stack completo es Fase 7)
+#   - postgres                -> Fase 1 (adelantado)
 #   - redis                   -> Fase 6 (standalone, para el rate limiter)
+#   - app                     -> Fase 7 (la API dockerizada; stack completo)
 #   - minio                   -> Fase 8
 #   - meilisearch              -> Fase 10
 # (Sin clave `version:` - está deprecada en Compose v2.)
@@ -8,6 +9,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: user
       POSTGRES_PASSWORD: password
@@ -25,6 +27,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6379:6379"
     healthcheck:
@@ -32,6 +35,44 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Nombres de servicio de compose (red interna), no localhost: el resto de
+      # secretos (JWT_SECRET_KEY, TOTP_ENCRYPTION_KEY, ...) vienen del .env real
+      # del desarrollador via env_file de abajo - "environment" pisa a "env_file"
+      # para estas claves concretas sin tener que duplicarlas a mano aqui.
+      DATABASE_URL: postgresql+psycopg://user:password@postgres:5432/spotify_clone
+      REDIS_URL: redis://redis:6379/0
+      # Default real es True (config.py) - sobre HTTP local sin este override el
+      # navegador/curl no reenvía la cookie Secure del refresh token.
+      COOKIE_SECURE: "false"
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
 
 volumes:
   postgres_data:

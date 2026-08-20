@@ -170,6 +170,56 @@ visible. Corregido estrechando el `except` a `redis.RedisError` únicamente alre
 a Redis (`run_in_threadpool`); el parseo, fuera del `try`, ahora sí propagaría como error real si
 algo cambiara ahí.
 
+**Fase 7 — Contenedores (Docker, docker-compose, healthchecks).** Nuevo `Dockerfile`
+(multi-stage): etapa `builder` instala solo `requirements.txt` (nunca `requirements-dev.txt`) en
+un virtualenv en `/opt/venv`; etapa final copia únicamente ese venv ya construido + `app/` +
+`alembic.ini`, corre como usuario no-root (`useradd --system`), con `HEALTHCHECK` propio (un
+one-liner de Python contra `GET /health`, sin depender de `curl`). `ENTRYPOINT` nuevo
+(`docker/entrypoint.sh`) aplica `alembic upgrade head` antes de `exec`utar el `CMD`
+(`uvicorn app.main:app`), así que el contenedor migra solo al arrancar. Nuevo servicio `app` en
+`docker-compose.yml`, con `depends_on: condition: service_healthy` sobre `postgres`/`redis` — el
+"healthcheck cruzado" que se lleva prometiendo desde la Fase 1 — y `DATABASE_URL`/`REDIS_URL`
+sobreescritas a los hostnames internos de compose (`postgres`/`redis`) en vez de `localhost`.
+Nuevo job `docker` en CI (`needs: test`): construye la imagen y la arranca de verdad contra
+postgres/redis reales de CI (`--network host`), esperando `GET /health` con reintentos antes de
+darlo por bueno — un smoke test real, no solo "el Dockerfile tiene sintaxis válida". **Matiz
+importante encontrado en la ronda de revisión post-implementación (abogado del diablo)**:
+`GET /health` es un chequeo de *liveness* puro (`app/main.py`) — no toca Postgres ni Redis en
+runtime, solo demuestra que el proceso de `uvicorn` está vivo. La conexión a Postgres sí queda
+probada indirectamente (el `ENTRYPOINT` migra antes de arrancar; si Postgres fallara, el contenedor
+ni llegaría a servir `/health`), pero Redis no se ejercitaba en absoluto — y al ser el rate limiter
+fail-open (Fase 6), un `REDIS_URL` roto habría pasado el smoke test igual, en silencio. Corregido
+añadiendo un segundo paso que hace `POST /auth/register` y exige la cabecera `X-RateLimit-Limit`
+en la respuesta — esa cabecera solo se añade en el camino feliz del rate limiter (Redis respondió
+con éxito), nunca en fail-open, así que su ausencia expone un Redis inalcanzable que `/health` por
+sí solo no habría detectado.
+
+Verificación manual (no solo automatizada): `docker compose up -d --build` con los tres servicios
+`healthy`, y el flujo completo registro → login → `/2fa/setup` → `/2fa/verify` → activar premium →
+`GET /auth/me` probado por primera vez contra la imagen de producción real, no contra el proceso
+de desarrollo local de siempre. También se verificó explícitamente que `pip list` dentro de la
+imagen no incluye pytest/ruff/black/mypy, y que el proceso corre como usuario no-root.
+
+**Bug real encontrado durante la propia verificación de esta fase** (no en la ronda de revisión de
+Agent Teams, sino al ejecutar los comandos de verificación del plan): `docker run --rm <imagen>
+pip list` y `docker run --rm <imagen> whoami` fallaban silenciosamente, porque `docker run <imagen>
+<comando>` sustituye el `CMD`, no el `ENTRYPOINT` — `docker/entrypoint.sh` seguía ejecutándose
+primero e intentando `alembic upgrade head`, que requiere `JWT_SECRET_KEY`/`TOTP_ENCRYPTION_KEY`
+válidas (import eager de `app.core.config.settings` desde `env.py`, acoplamiento preexistente de
+Fase 1: instanciar `Settings()` valida TODAS las variables, no solo las que usa cada comando
+concreto) para poder siquiera importar el módulo. Sin esas variables (no se pasaron en esos
+`docker run` sueltos de introspección), el contenedor fallaba con un `ValidationError` antes de
+llegar a `pip list`/`whoami`. Además, el primer intento de verificar esto con un `grep` sobre la
+salida enmascaró el fallo real como si fuera un "OK" (el patrón buscado —
+`pytest|ruff|black|mypy`— no aparecía en el traceback de error, así que el `|| echo "OK"` de la
+propia verificación se disparó por la razón equivocada). Corregido usando
+`docker run --rm --entrypoint pip/whoami <imagen> ...` para esos chequeos de introspección
+(que no necesitan migrar nada), re-verificado con salida real esta vez. No es un bug del
+`Dockerfile` en sí — el camino real (`docker compose up`, con todas las variables presentes vía
+`env_file`) siempre funcionó — pero sí una lección sobre cómo `ENTRYPOINT` interactúa con `docker
+run <comando>` y sobre no confiar en un pase de verificación cuyo propio mecanismo de comprobación
+(`grep` + `||`) puede enmascarar el fallo que se supone que debía detectar.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -189,7 +239,7 @@ proyecto de portfolio).
 | 4    | Calidad de código local                   | ✅ Implementado |
 | 5    | CI                                        | ✅ Implementado |
 | 6    | Rate limiter con Redis                    | ✅ Implementado |
-| 7    | Contenedores                              | ⬜ Pendiente    |
+| 7    | Contenedores                              | ✅ Implementado |
 | 8    | Subida y transcodificación de audio       | ⬜ Pendiente    |
 | 9    | Streaming de audio                        | ⬜ Pendiente    |
 | 10   | Búsqueda                                  | ⬜ Pendiente    |
@@ -235,8 +285,8 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   `create_all()` más adelante.
 - **Postgres adelantado a la Fase 1** (en vez de esperar a la Fase 7): la Fase 1 necesita una base
   de datos real para el modelo de usuario; se adelanta solo el contenedor de Postgres en
-  `docker-compose.yml`, el resto del stack completo (API dockerizada, healthchecks cruzados) sigue
-  siendo Fase 7.
+  `docker-compose.yml`, el resto del stack completo (API dockerizada, healthchecks cruzados) queda
+  para la Fase 7 — **implementado en Fase 7**, ver esa sección.
 - **Mitigación de timing side-channel en `/auth/login`**: cuando el email no existe, se ejecuta
   igualmente un hash bcrypt contra un valor "dummy" para que la respuesta tarde lo mismo que con
   una contraseña incorrecta, evitando enumerar emails registrados por diferencia de tiempo.
@@ -388,6 +438,66 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   el Resumen de esta fase — un cliente async queda ligado al event loop en el que se usa por
   primera vez, riesgo real de arquitectura, no solo un artefacto de tests.
 
+**Fase 7 — Contenedores**
+
+- **Multi-stage, aunque casi ninguna dependencia necesite compilarse**: verificado explícitamente
+  (revisión DevOps) que `psycopg[binary]`, `cryptography`, `bcrypt`, `qrcode[pil]` publican wheels
+  manylinux para `python:3.12-slim` — no hace falta gcc/libpq-dev/libffi-dev del sistema. El
+  multi-stage aquí no ahorra un toolchain de compilación real (a diferencia del caso de uso típico
+  que lo justifica); su valor es separar la etapa de build (pip, caché) de la imagen final, y
+  asegurar mecánicamente que `requirements-dev.txt` nunca llega a producción. Aceptado como la
+  única pieza del diseño sin beneficio técnico contundente, pero consistente con demostrar
+  prácticas de imagen de producción.
+- **`ENV PATH="/opt/venv/bin:$PATH"` explícito tras copiar el venv entre stages**: paso
+  imprescindible del patrón "copiar venv" que la primera versión de este plan omitió (hallazgo
+  bloqueante de la revisión DevOps y del abogado del diablo antes de implementar) — sin él, ni
+  `alembic` ni `uvicorn` existen en el `PATH` de la imagen final y el contenedor no arranca.
+- **Import de `app.*` resuelto por `WORKDIR /app` + `prepend_sys_path = .` de `alembic.ini`, no por
+  un `PYTHONPATH` extra**: la primera versión de este plan atribuía la solución del import a un
+  `ENV PYTHONPATH=/app`, que en realidad no era la pieza que arreglaba nada (corregido tras la
+  revisión, ver Resumen). Se mantiene de todos modos `PYTHONDONTWRITEBYTECODE=1
+  PYTHONUNBUFFERED=1` por higiene (usuario no-root, logs sin buffer), no como fix de import.
+- **Usuario no-root (`useradd --system`), sin necesidad de `chown` selectivo en runtime**:
+  verificado (revisión de seguridad) que la app no escribe a disco en ningún momento de su
+  ejecución normal (solo sirve `app/static` y loguea a stdout; `alembic upgrade head` solo escribe
+  a Postgres) — el `chown -R app:app /app` del build es suficiente, no hace falta ningún volumen
+  writable adicional.
+- **Migraciones automáticas en el `ENTRYPOINT`, no un paso manual**: `docker/entrypoint.sh` corre
+  `alembic upgrade head` antes de `exec`utar `uvicorn`. Riesgo aceptado a propósito, no resuelto en
+  esta fase: con más de una réplica arrancando a la vez, cada una correría la migración de forma
+  concurrente (Alembic no tiene locking distribuido incorporado) — aceptable mientras esta fase no
+  levante réplicas reales; revisar si/cuando la Fase 14 (CD) las introduzca, moviendo la migración
+  a un job/init-container separado de las réplicas de la API.
+- **Secretos nunca horneados en la imagen**: el `Dockerfile` no copia `.env` ni recibe secretos vía
+  `ARG`/`ENV` en build time; `docker-compose.yml` los pasa en runtime vía `env_file: .env`
+  (secretos reales del desarrollador) combinado con `environment:` explícito solo para
+  `DATABASE_URL`/`REDIS_URL`/`COOKIE_SECURE` (que necesitan apuntar a los hostnames internos de
+  compose, no a `localhost`). `.dockerignore` excluye `.env` como defensa en profundidad adicional
+  (el build context de `docker build .` sí incluye todo el directorio salvo lo excluido ahí, aunque
+  el `Dockerfile` luego solo copie `app/`/`alembic.ini` explícitamente).
+- **`COOKIE_SECURE: "false"` fijado explícitamente en el servicio `app` de compose, no delegado al
+  `.env`**: el default real en `config.py` es `cookie_secure: bool = True` — sin este override, la
+  verificación por `curl` del flujo completo (login→2FA→premium) sobre HTTP local habría fallado
+  porque el cliente no reenvía la cookie `Secure` del refresh token (hallazgo confirmado por
+  DevOps y el abogado del diablo antes de implementar).
+- **`security_opt: no-new-privileges:true` + `cap_drop: ALL` solo en el servicio `app`**, no en
+  `postgres`/`redis` (que podrían necesitar capacidades propias para su propio entrypoint/initdb):
+  hardening barato y de alto valor de señal para un proyecto de portfolio, sin arriesgar romper
+  imágenes de terceros ya funcionando. Se descartó explícitamente ir más lejos (`read_only:
+  true`+tmpfs, límites de recursos) por ser sobre-ingeniería sin réplicas ni carga real que
+  proteger en esta fase.
+- **CI: pass-through de secrets (`docker run -e VAR`, sin `=valor` inline)**: el contenedor hereda
+  el valor desde el `env:` del step en vez de interpolarlo en la línea de comando — evita que el
+  secreto aparezca en `docker inspect`/logs del contenedor. Defensa en profundidad barata sobre
+  secrets que ya son CI-only sin dato real detrás.
+- **Base `python:3.12.7-slim-bookworm` pinneada a versión y tag exactos, no `3.12-slim` flotante**:
+  reproducibilidad del build a cambio de un trade-off real reconocido explícitamente (revisión de
+  seguridad): no recibe parches de seguridad del SO/Python automáticamente. Mantenimiento pendiente
+  aceptado: rebuild/bump manual periódico de la versión pinneada.
+- **La password de Postgres en `docker-compose.yml` (`user:password`) es la misma credencial
+  dev-only** que ya vive hardcodeada ahí y en CI desde la Fase 1 — documentado explícitamente para
+  que quede claro que no es un descuido de esta fase, no un secreto real.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -436,6 +546,21 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   silencio — falla ruidoso, no silencioso, pero sigue siendo fricción a documentar (ver README).
 - ~~`pytest-cov` sin umbral obligatorio~~ — **resuelto en Fase 5**: `--cov-fail-under=85` en CI
   (esta entrada quedó sin actualizar hasta la revisión de documentación de la Fase 6).
+- **Migraciones automáticas del `ENTRYPOINT` no soportan réplicas concurrentes** (Fase 7): si en el
+  futuro hay más de una réplica del contenedor de la API arrancando a la vez, cada una correría
+  `alembic upgrade head` de forma concurrente — Alembic no tiene locking distribuido incorporado.
+  Aceptado mientras esta fase no levante réplicas reales; a resolver si/cuando la Fase 14 (CD) las
+  introduzca (mover la migración a un job/init-container separado).
+- **La imagen Docker todavía no se publica en ningún registry** (Fase 7): solo se construye
+  localmente/en CI como smoke test, nunca se hace `docker push`. Publicar y versionar la imagen es
+  explícitamente Fase 14 (CD).
+- **Un único contenedor de la API, sin réplicas reales** (Fase 7): el diseño multi-réplica que ya
+  asumía el rate limiter con Redis (Fase 6, justificación de "por qué Redis y no memoria local")
+  sigue siendo teórico hasta que haya un balanceador delante — sin fase de proxy/CDN todavía
+  (Fase 9/15).
+- **Base `python:3.12.7-slim-bookworm` pinneada, sin parches de seguridad automáticos** (Fase 7):
+  trade-off aceptado por reproducibilidad del build; requiere un bump manual periódico de la
+  versión pinneada, no ocurre solo.
 
 ## Cómo escalaría esto en producción real
 
