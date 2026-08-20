@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.db.session import get_db
+from app.models.play import SongPlay
 from app.models.song import Song
 from app.models.user import User
 from app.schemas.song import SongRead, SongStreamURL
@@ -321,4 +322,23 @@ def get_song_stream_url(
     url = storage.generate_presigned_url(
         song.transcoded_object_key, expires_in=_STREAM_URL_EXPIRES_IN_SECONDS
     )
+
+    # Best-effort, nunca bloquea la respuesta de streaming (Fase 11, hallazgo
+    # de la revisión del plan): un fallo específico de este insert (deadlock,
+    # serialization failure) no debe degradar una función núcleo que hoy es
+    # puramente de lectura, solo porque falló una señal de analítica. Registra
+    # "el usuario pidió esta URL", no "escuchó la canción completa" - no hay
+    # UI de reproducción en este proyecto (Fase 9), es la señal más fiel
+    # disponible.
+    try:
+        db.add(SongPlay(user_id=current_user.id, song_id=song.id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "No se pudo registrar el play de la canción %s para el usuario %s",
+            song.id,
+            current_user.id,
+        )
+
     return SongStreamURL(url=url, expires_in=_STREAM_URL_EXPIRES_IN_SECONDS)

@@ -27,3 +27,6 @@ boto3==1.43.75
 # Fase 10: búsqueda (Meilisearch) - cliente oficial, publica py.typed (no
 # hace falta ningún paquete de stubs ni override de mypy)
 meilisearch==0.43.0
+
+# Fase 11: recomendaciones precalculadas - cola de tareas en background
+celery==5.6.3

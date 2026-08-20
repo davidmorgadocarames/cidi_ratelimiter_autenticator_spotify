@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     meilisearch_url: str = "http://localhost:7700"
     meilisearch_api_key: str = "change-me"
 
+    # Broker de Celery (Fase 11) - mismo Redis que redis_url pero DB 1, no DB 0:
+    # evita que el flushdb() autouse de los tests (o un futuro flush operacional
+    # de los buckets del rate limiter) se lleve por delante el estado interno de
+    # la cola de Celery. No es un secreto (referencia de infraestructura, igual
+    # que redis_url), sin validador anti-"change-me".
+    celery_broker_url: str = "redis://localhost:6379/1"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:

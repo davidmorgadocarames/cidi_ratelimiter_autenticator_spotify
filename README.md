@@ -19,7 +19,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-10 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-11 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -29,9 +29,9 @@ limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza b
 completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados con
 postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` + MinIO) con un
 catálogo público de canciones, streaming real con Range Requests vía URLs firmadas de MinIO
-(control plane/data plane), y búsqueda de canciones por título/artista con Meilisearch. Ver el
-roadmap completo abajo y el detalle de qué está implementado vs pendiente en
-[`docs/architecture.md`](docs/architecture.md).
+(control plane/data plane), búsqueda de canciones por título/artista con Meilisearch, y
+recomendaciones precalculadas por afinidad de artista con Celery. Ver el roadmap completo abajo y
+el detalle de qué está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
@@ -173,6 +173,29 @@ consultar Postgres (válido mientras no exista edición/borrado de canciones —
 (sin backfill en el alcance actual). Decisiones completas en
 [`docs/architecture.md`](docs/architecture.md).
 
+## Recomendaciones (Fase 11)
+
+`GET /users/me/recommendations` devuelve una lista precalculada de canciones recomendadas para el
+usuario autenticado. "Precalculadas" en sentido literal: toda la agregación pesada ocurre en una
+tarea periódica de [Celery](https://docs.celeryq.dev/) (Celery Beat, cada 5 min), no en el propio
+request — el endpoint es una lectura barata contra Redis, nunca calcula nada en vivo. Cada
+`GET /songs/{id}/stream` registra un "play" (best-effort, en `song_plays` de Postgres — no bloquea
+el streaming si falla, mismo principio fail-open que la indexación en Meilisearch de la Fase 10).
+El algoritmo es una heurística simple, no aprendizaje automático: recomienda canciones de artistas
+que el usuario ya escuchó (afinidad por conteo de plays), con fallback a popularidad global y,
+en última instancia, a las canciones más recientes — deliberadamente distinto de un ranking global
+simple para no solapar con la futura Fase 12 (caché de contenido popular). Antes del primer ciclo
+de Beat (o para un usuario sin actividad todavía) el endpoint devuelve `200` con lista vacía, un
+estado normal, no un error. Verificación manual sin esperar los 5 min del Beat:
+
+```bash
+docker compose exec celery-worker celery -A app.worker call app.worker.recompute_all_recommendations
+```
+
+Decisiones completas (por qué Redis para el resultado pero Postgres para la señal fuente, el lock
+contra pases solapados, por qué el engine de Postgres del worker se crea de forma perezosa, y los
+riesgos aceptados) en [`docs/architecture.md`](docs/architecture.md).
+
 ## Stack técnico (previsto)
 
 - **Backend**: Python 3 + FastAPI
@@ -210,8 +233,9 @@ consultar Postgres (válido mientras no exista edición/borrado de canciones —
 Requiere Python 3.13 en local (única versión instalada en esta máquina). El CI (Fase 5) corre
 además la suite completa contra 3.10/3.11/3.12 en GitHub Actions — verificado en verde en las
 tres, ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos). Requiere también
-Docker (para Postgres, adelantado a la Fase 1; Redis, adelantado a la Fase 6; MinIO, Fase 8; y
-Meilisearch, Fase 10), y `ffmpeg`/`ffprobe` instalados en el sistema (Fase 8,
+Docker (para Postgres, adelantado a la Fase 1; Redis, adelantado a la Fase 6; MinIO, Fase 8;
+Meilisearch, Fase 10; y Celery worker/beat, Fase 11), y `ffmpeg`/`ffprobe` instalados en el
+sistema (Fase 8,
 subida/transcodificación de audio — **no** es un paquete pip, es un binario de sistema; en
 Windows: `winget install --id Gyan.FFmpeg -e`, verificar con `ffmpeg -version`; dentro de Docker
 ya viene instalado en la imagen, ver Dockerfile).
@@ -241,11 +265,13 @@ un valor por defecto (`redis://localhost:6379/0`) sin validador de placeholder, 
 `JWT_SECRET_KEY` — deben coincidir con `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` del servicio
 `minio` de `docker-compose.yml` (que los lee del propio `.env`, ver esa sección).
 `MEILISEARCH_API_KEY` (Fase 10) tiene el mismo validador anti-`change-me` y debe coincidir con
-`MEILI_MASTER_KEY` del servicio `meilisearch`, mismo mecanismo. El resto de variables se van
-sumando fase a fase.
+`MEILI_MASTER_KEY` del servicio `meilisearch`, mismo mecanismo. `CELERY_BROKER_URL` (Fase 11) no
+tiene validador (no es un secreto, referencia de infraestructura igual que `REDIS_URL`) — mismo
+Redis, DB 1 en vez de DB 0. El resto de variables se van sumando fase a fase.
 
 Levantar Postgres, Redis, MinIO y Meilisearch, y aplicar las migraciones, antes de correr la API o
-los tests:
+los tests (el worker/beat de Celery, Fase 11, no hacen falta para correr `pytest` — los tests
+llaman la lógica de negocio directo, sin un broker real, ver `docs/architecture.md`):
 
 ```bash
 docker compose up -d postgres redis minio meilisearch
@@ -267,7 +293,7 @@ placeholder `change-me`) — el `ENTRYPOINT` migra al arrancar y esa migración 
 a la vez, o el segundo falla con "address already in use".
 
 ```bash
-docker compose up -d --build   # postgres + redis + minio + meilisearch + la API, las 5 healthy antes de servir
+docker compose up -d --build   # postgres + redis + minio + meilisearch + la API + celery-worker/beat
 curl http://localhost:8000/health
 ```
 

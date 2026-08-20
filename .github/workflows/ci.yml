@@ -80,6 +80,12 @@ jobs:
       # no es un secreto real (igual que las credenciales de MinIO), solo-CI.
       MEILISEARCH_URL: http://localhost:7700
       MEILISEARCH_API_KEY: ci-meilisearch-master-key-not-a-real-secret
+      # Mismo Redis que el servicio "redis" de arriba, DB 1 (namespace lógico
+      # distinto, no necesita nada adicional en "services:"). El worker/beat
+      # reales no se levantan en este job - la suite llama a la lógica de
+      # negocio directamente contra Postgres/Redis reales, sin pasar por un
+      # broker real (ver tests/test_recommendations.py).
+      CELERY_BROKER_URL: redis://localhost:6379/1
 
     steps:
       - uses: actions/checkout@v4
@@ -186,6 +192,10 @@ jobs:
       # /songs/search (mismo motivo que S3_* justo debajo).
       MEILISEARCH_URL: http://localhost:7700
       MEILISEARCH_API_KEY: ci-meilisearch-master-key-not-a-real-secret
+      # Mismo Redis del servicio "redis" de este job, DB 1 - usado por el paso
+      # "Run celery-worker" de abajo, la única verificación end-to-end real
+      # (broker -> worker -> Redis) de toda la fase.
+      CELERY_BROKER_URL: redis://localhost:6379/1
       JWT_SECRET_KEY: ${{ secrets.CI_JWT_SECRET_KEY }}
       TOTP_ENCRYPTION_KEY: ${{ secrets.CI_TOTP_ENCRYPTION_KEY }}
       # Este job no levanta MinIO (solo hace smoke-test de /health, no de
@@ -264,3 +274,77 @@ jobs:
       - name: Stop container
         if: always()
         run: docker rm -f cidi-api-ci || true
+
+      - name: Run celery-worker and verify real broker connectivity
+        # El usuario "ci-smoke@example.com" ya existe en Postgres desde el
+        # paso "Smoke-test Redis real" de arriba (el servicio "postgres" del
+        # job sigue vivo aunque cidi-api-ci ya se haya parado) - la tarea
+        # recorre todos los usuarios, así que sin al menos uno no se
+        # escribiría ninguna clave "recommendations:*" y este paso daría
+        # falso negativo por falta de datos, no por un fallo real.
+        # Mismo patrón manual "docker run" que "app" arriba, reusando la misma
+        # imagen con entrypoint/command de Celery (igual que docker-compose.yml).
+        # Corregido en la revisión del plan: comprobar solo que el proceso
+        # siga "Running" da falso positivo - un worker que no puede alcanzar
+        # el broker reintenta con backoff y sigue "vivo" igual, logueando el
+        # error en vez de salir. En su lugar: (1) grep en los logs de la línea
+        # de arranque exitoso ("... ready.") confirma que conectó al broker de
+        # verdad; (2) dispara la tarea real contra el broker real y hace
+        # polling sobre Redis hasta ver aparecer una clave "recommendations:*"
+        # - la única cobertura automatizada de infraestructura real para la
+        # ruta completa CLI -> broker -> worker -> Redis (el job "test" de
+        # arriba llama la lógica de negocio directo, sin broker real).
+        run: |
+          docker run -d --name celery-worker-ci \
+            --network host \
+            --entrypoint celery \
+            -e DATABASE_URL \
+            -e REDIS_URL \
+            -e CELERY_BROKER_URL \
+            -e JWT_SECRET_KEY \
+            -e TOTP_ENCRYPTION_KEY \
+            -e S3_ENDPOINT_URL \
+            -e S3_ACCESS_KEY \
+            -e S3_SECRET_KEY \
+            -e S3_BUCKET_NAME \
+            -e MEILISEARCH_URL \
+            -e MEILISEARCH_API_KEY \
+            cidi-api:ci \
+            -A app.worker worker --loglevel=info
+
+          ready=""
+          for i in $(seq 1 15); do
+            if docker logs celery-worker-ci 2>&1 | grep -q "ready\."; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$ready" ]; then
+            echo "El worker de Celery no conectó al broker a tiempo. Logs:"
+            docker logs celery-worker-ci
+            exit 1
+          fi
+
+          docker exec celery-worker-ci celery -A app.worker call app.worker.recompute_all_recommendations
+
+          found=""
+          for i in $(seq 1 15); do
+            keys=$(docker run --rm --network host redis:7-alpine redis-cli -n 0 keys "recommendations:*")
+            if [ -n "$keys" ]; then
+              found=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [ -z "$found" ]; then
+            echo "No apareció ninguna clave recommendations:* en Redis tras disparar la tarea. Logs del worker:"
+            docker logs celery-worker-ci
+            exit 1
+          fi
+
+      - name: Stop celery-worker
+        if: always()
+        run: docker rm -f celery-worker-ci || true

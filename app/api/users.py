@@ -1,4 +1,6 @@
+import redis
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
@@ -8,6 +10,7 @@ from app.api.totp import (
     register_totp_failure,
     register_totp_success,
 )
+from app.core.config import settings
 from app.core.security import (
     TOTPDecryptionError,
     decrypt_totp_secret,
@@ -15,10 +18,21 @@ from app.core.security import (
     verify_totp_code,
 )
 from app.db.session import get_db
+from app.models.song import Song
 from app.models.user import User
+from app.schemas.song import SongRead
 from app.schemas.user import PremiumActivateRequest, UserRead
+from app.services.recommendations import get_recommendations
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+# Cliente Redis a nivel de módulo (mismo patrón que app/core/rate_limiter.py):
+# el proceso de FastAPI no hace fork, así que no aplica el footgun de
+# Celery+prefork que sí exige crear el cliente perezosamente dentro de la
+# tarea en app/worker.py.
+_redis_client: redis.Redis = redis.from_url(  # type: ignore[no-untyped-call]
+    settings.redis_url, decode_responses=True
+)
 
 
 @router.post("/me/premium/activate", response_model=UserRead)
@@ -81,3 +95,29 @@ def deactivate_premium(
     db.commit()
     db.refresh(current_user)
     return current_user
+
+
+@router.get("/me/recommendations", response_model=list[SongRead])
+def get_my_recommendations(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[Song]:
+    """Lee las recomendaciones YA precalculadas por Celery Beat (ver
+    app/worker.py) - toda la agregación pesada ocurre en la tarea periódica,
+    no aquí (ese es justo el punto de "recomendaciones precalculadas": este
+    endpoint es un GET barato, no un cálculo en vivo).
+
+    Sin recomendaciones todavía (usuario nuevo, o Beat aún no corrió su
+    primer ciclo) es un estado NORMAL y esperado, no una caída de servicio -
+    a diferencia de la búsqueda en Meilisearch (Fase 10), que responde 503
+    si el motor no está disponible: aquí se devuelve 200 con lista vacía."""
+    song_ids = get_recommendations(_redis_client, current_user.id)
+    if not song_ids:
+        return []
+
+    songs = db.scalars(select(Song).where(Song.id.in_(song_ids))).all()
+    songs_by_id = {song.id: song for song in songs}
+    # Preserva el orden de Redis (el ranking), no el orden natural de la
+    # consulta SQL - un id colgante (canción borrada en el futuro) se omite
+    # en vez de romper la respuesta.
+    return [songs_by_id[song_id] for song_id in song_ids if song_id in songs_by_id]
