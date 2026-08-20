@@ -160,6 +160,17 @@ jobs:
       COOKIE_SECURE: "false"
       JWT_SECRET_KEY: ${{ secrets.CI_JWT_SECRET_KEY }}
       TOTP_ENCRYPTION_KEY: ${{ secrets.CI_TOTP_ENCRYPTION_KEY }}
+      # Este job no levanta MinIO (solo hace smoke-test de /health, no de
+      # /songs) - pero Settings rechaza el placeholder "change-me" para
+      # S3_ACCESS_KEY/S3_SECRET_KEY al importar app.core.config, y esa
+      # importación ocurre igualmente en el ENTRYPOINT (alembic upgrade head)
+      # aunque el endpoint que se prueba no toque S3 en absoluto. La app
+      # arranca igual sin MinIO real disponible (fail-open en el lifespan,
+      # ver app/main.py) - solo hacen falta valores que pasen la validación.
+      S3_ENDPOINT_URL: http://localhost:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin123
+      S3_BUCKET_NAME: songs
 
     steps:
       - uses: actions/checkout@v4
@@ -181,6 +192,10 @@ jobs:
             -e COOKIE_SECURE \
             -e JWT_SECRET_KEY \
             -e TOTP_ENCRYPTION_KEY \
+            -e S3_ENDPOINT_URL \
+            -e S3_ACCESS_KEY \
+            -e S3_SECRET_KEY \
+            -e S3_BUCKET_NAME \
             cidi-api:ci
 
           ok=""

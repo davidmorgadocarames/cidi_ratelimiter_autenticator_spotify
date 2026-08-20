@@ -300,6 +300,19 @@ ya aplicado al rate limiter con Redis en la Fase 6: el resto de la API no debe q
 disponibilidad de MinIO. Re-verificado empíricamente tras el fix: la app arranca y sirve `/health`
 en segundos aunque MinIO esté caído (solo `/songs` fallaría).
 
+**Bug real encontrado por el propio CI** (no en local, no en la revisión): el job `docker` de CI
+(smoke test de la imagen, sin MinIO real - solo prueba `/health` y `/auth/register`) empezó a
+fallar al abrir el PR porque su `env:` nunca ganó las variables `S3_*` nuevas de esta fase — el
+validador anti-`change-me` de `s3_access_key`/`s3_secret_key` rechazaba el default de `Settings`
+antes de que el `ENTRYPOINT` (que importa `app.core.config` para migrar) llegara siquiera a
+arrancar `uvicorn`. El fail-open del `lifespan` (bug anterior de este mismo resumen) no llegaba a
+activarse porque el fallo ocurría ANTES, al instanciar `Settings()`, no al llamar
+`ensure_bucket_exists()`. Corregido añadiendo `S3_ENDPOINT_URL`/`S3_ACCESS_KEY`/`S3_SECRET_KEY`/
+`S3_BUCKET_NAME` (valores CI-only, no MinIO real) al `env:` del job y al pass-through `-e` del
+`docker run` — re-verificado localmente simulando el mismo escenario exacto (imagen real,
+credenciales S3 válidas, endpoint inalcanzable) antes de repushear: el contenedor arranca
+`healthy` y `/health` responde `200`, con el warning de fail-open esperado en los logs.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
