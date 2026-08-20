@@ -2,7 +2,7 @@
 #   - postgres                -> Fase 1 (adelantado)
 #   - redis                   -> Fase 6 (standalone, para el rate limiter)
 #   - app                     -> Fase 7 (la API dockerizada; stack completo)
-#   - minio                   -> Fase 8
+#   - minio                   -> Fase 8 (almacenamiento de audio, compatible S3)
 #   - meilisearch              -> Fase 10
 # (Sin clave `version:` - está deprecada en Compose v2.)
 
@@ -36,6 +36,36 @@ services:
       timeout: 5s
       retries: 5
 
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      # Resuelto desde el .env de la raiz (Docker Compose lo lee automaticamente
+      # para interpolar ${VAR} dentro del propio YAML - mecanismo distinto y
+      # adicional a env_file, que pasa variables DENTRO del contenedor). Si .env
+      # no tuviera estas claves, Compose sustituiria una cadena vacia con un
+      # warning en stderr en vez de fallar - no deberia darse en la practica
+      # porque S3_ACCESS_KEY/S3_SECRET_KEY ya son necesarias para que la propia
+      # app arranque (validador anti-"change-me" en config.py).
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9000:9000" # API S3
+      - "9001:9001" # consola web
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      # Verificado empiricamente: la imagen oficial minio/minio SI trae curl
+      # (a diferencia de lo que exigiria un healthcheck via GitHub Actions
+      # "services:", que no soporta pasar el "command: server /data" que este
+      # servicio necesita - ver el job "test" de ci.yml, que arranca MinIO con
+      # un "docker run -d" manual en vez de "services:").
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   app:
     build: .
     restart: unless-stopped
@@ -46,6 +76,7 @@ services:
       # para estas claves concretas sin tener que duplicarlas a mano aqui.
       DATABASE_URL: postgresql+psycopg://user:password@postgres:5432/spotify_clone
       REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT_URL: http://minio:9000
       # Default real es True (config.py) - sobre HTTP local sin este override el
       # navegador/curl no reenvía la cookie Secure del refresh token.
       COOKIE_SECURE: "false"
@@ -56,6 +87,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test:
@@ -76,3 +109,4 @@ services:
 
 volumes:
   postgres_data:
+  minio_data:

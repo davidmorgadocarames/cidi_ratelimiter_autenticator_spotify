@@ -10,3 +10,7 @@ ruff==0.7.4
 black==24.10.0
 mypy==1.13.0
 pre-commit==4.0.1
+
+# Fase 8: stubs de boto3 para mypy --strict (boto3/botocore no publican tipos
+# inline) - solo el subconjunto "s3" que usa el proyecto
+boto3-stubs[s3]==1.43.75

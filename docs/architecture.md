@@ -220,6 +220,86 @@ propia verificación se disparó por la razón equivocada). Corregido usando
 run <comando>` y sobre no confiar en un pase de verificación cuyo propio mecanismo de comprobación
 (`grep` + `||`) puede enmascarar el fallo que se supone que debía detectar.
 
+**Fase 8 — Subida y transcodificación de audio (ffmpeg, MinIO).** Primer dominio real del
+"Spotify clone": nuevo modelo `Song` (`app/models/song.py`), router `app/api/songs.py`
+(`POST /songs`, `GET /songs`, `GET /songs/{id}`), y primer uso real de `app/services/` —
+`storage.py` (cliente `boto3` contra MinIO) y `transcode.py` (wrappers `subprocess` sobre
+`ffmpeg`/`ffprobe`, binarios de sistema instalados aparte, no paquetes pip). Flujo síncrono dentro
+del propio request: se lee el archivo con límite de 20MB, se valida con `ffprobe` (la validación
+real de "es audio de verdad", nunca el `Content-Type` del cliente), se sube el original a MinIO,
+se transcodifica a mp3 192kbps, se sube el transcodificado, y se actualiza el estado de la fila
+(`processing` → `ready`/`failed`). **Contrato de la API a tener en cuenta**: `POST /songs`
+devuelve `201` en cuanto el archivo se valida como audio real (incluso si algo falla DESPUÉS, en
+la subida a MinIO o la transcodificación) — el código HTTP por sí solo no garantiza
+`status="ready"`; el cliente debe mirar el campo `status` del cuerpo de la respuesta. Solo un
+archivo que `ffprobe` rechaza de entrada (nunca llega a crear una fila) da `422`. Catálogo público:
+cualquier usuario autenticado ve cualquier canción, no solo las propias. Nuevo servicio `minio` en
+`docker-compose.yml` y capa `apt-get
+install ffmpeg` en el `Dockerfile` (creció la imagen 467MB, de ~600MB a 1.06GB — cuantificado con
+`docker history`, no solo estimado). 9 tests nuevos (`tests/test_songs.py`) contra MinIO y ffmpeg
+reales (fixture que genera un tono de 1s con `ffmpeg -f lavfi`, nada de fixtures binarias
+commiteadas), incluyendo descargar el objeto transcodificado de MinIO y volver a pasarlo por
+`ffprobe` para confirmar que es audio válido de verdad, no solo que "algo" se subió, y (añadidos en
+la ronda de revisión post-implementación) una prueba que fuerza un fallo a mitad del pipeline y
+otra que ejercita el límite de tamaño por chunks en aislamiento, sin pasar por HTTP.
+
+**La ronda de revisión Agent Teams sobre el PLAN (antes de escribir código) encontró y corrigió 4
+bloqueantes** — el nivel de rigor más alto de cualquier fase hasta ahora en este proyecto:
+1. **Creación del bucket con TOCTOU**: la primera versión del plan creaba el bucket perezosamente
+   (`head_bucket` + `create_bucket` en el primer request) — dos primeras-subidas concurrentes
+   verían ambas 404 y ambas llamarían `create_bucket`, y MinIO devolvería `BucketAlreadyOwnedByYou`
+   al perdedor sin que el código lo manejara. Corregido creando el bucket una única vez al arrancar
+   (evento `startup` de FastAPI / fixture de sesión en tests), no perezosamente.
+2. **Object key derivada del nombre de archivo del cliente**: la primera versión del plan decía
+   "nombre de archivo saneado" sin mecanismo concreto — `file.filename` es dato controlado por el
+   atacante. Corregido a una key fija y predecible (`original/{song.id}/source`, sin extensión),
+   sin depender de ningún dato del cliente.
+3. **Prefijo del rate limiter incompleto**: `_RATE_LIMITED_PREFIXES` iba a llevar `"/songs/"` (con
+   barra final, como `/auth/`/`/users/`/`/2fa/`), pero `POST /songs`/`GET /songs` son exactamente
+   ese path sin barra — `"/songs".startswith("/songs/")` es `False`, así que la colección (el
+   endpoint de subida) habría quedado sin límite. Corregido a `"/songs"` sin barra.
+4. **`mypy --strict` habría roto con `boto3`** (sin stubs inline) si no se hubiera añadido
+   `boto3-stubs[s3]` a `requirements-dev.txt` — encontrado en la revisión antes de escribir una
+   sola línea de `app/services/storage.py`.
+
+Además, la propia implementación (no la revisión) documentó y aceptó explícitamente: `subprocess`
+siempre con lista de argumentos (nunca `shell=True`) y `timeout=` explícito en `ffmpeg`/`ffprobe`
+(30s/300s) para que un archivo malformado no cuelgue un hilo indefinidamente; y el límite de 20MB
+tiene alcance parcial honesto (Starlette ya vuelca el multipart completo a un
+`SpooledTemporaryFile` propio antes de que el código de la app pueda cortar — el límite acota el
+procesamiento/persistencia propios, no la recepción inicial de Starlette).
+
+**La ronda de revisión POST-implementación (sobre el código ya escrito, no el plan) encontró un
+bug real más**: `app/services/storage.py` ya tenía `delete_object()` con un docstring que decía
+"usada... en caso de fallo a mitad del pipeline", pero el `except` de `upload_song` nunca la
+llamaba — si el original ya se había subido a MinIO y la transcodificación fallaba después, ese
+objeto quedaba huérfano en el bucket para siempre (sin relación con el riesgo ya documentado de
+filas atascadas en `status="processing"`, que es sobre Postgres, no sobre MinIO). Corregido:
+`upload_song` ahora registra qué keys llegó a subir con éxito y las borra (best-effort) en el
+`except` antes de marcar `status="failed"`. Cubierto por un test nuevo
+(`test_upload_failure_mid_pipeline_marks_failed_and_cleans_up_orphan`, con `transcode_to_mp3`
+parcheado para fallar a propósito) que verifica tanto la respuesta como que el objeto
+efectivamente ya no existe en MinIO. De paso se aplicaron dos mejoras menores encontradas en la
+misma revisión: `db.flush()` en vez de un primer `commit()` al crear la fila (evita un round-trip
+extra y la ventana en la que otra transacción podría leer `original_object_key=""`), y el parseo
+de `Content-Length` ahora tolera un header malformado (antes un valor no numérico habría dado un
+`ValueError` sin capturar → 500 en vez de simplemente ignorar el atajo y seguir con la lectura por
+chunks, que es la defensa real).
+
+**Bug real encontrado durante la propia verificación de esta fase** (no en la ronda de revisión,
+sino al probar manualmente qué pasaba si MinIO no estaba disponible al arrancar): el cliente
+`boto3` usa por defecto timeouts de decenas de segundos, así que `ensure_bucket_exists()` en el
+evento `startup` de FastAPI dejaba el arranque de **toda la app** colgado indefinidamente si MinIO
+no respondía — no un fallo rápido, un cuelgue silencioso (verificado ejecutando `uvicorn` con MinIO
+parado: el proceso nunca terminaba de arrancar). Esto habría roto también el job `docker` de CI
+(que no levanta MinIO, solo Postgres/Redis para su smoke test de `/health`). Corregido en dos
+frentes: (a) `Config(connect_timeout=5, read_timeout=10, retries={"max_attempts": 1})` explícito en
+el cliente `boto3` de `app/services/storage.py`, y (b) el `lifespan` de `app/main.py` envuelve la
+llamada en un `try/except` que loguea y continúa en vez de propagar — mismo principio de fail-open
+ya aplicado al rate limiter con Redis en la Fase 6: el resto de la API no debe quedar rehén de la
+disponibilidad de MinIO. Re-verificado empíricamente tras el fix: la app arranca y sirve `/health`
+en segundos aunque MinIO esté caído (solo `/songs` fallaría).
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -240,7 +320,7 @@ proyecto de portfolio).
 | 5    | CI                                        | ✅ Implementado |
 | 6    | Rate limiter con Redis                    | ✅ Implementado |
 | 7    | Contenedores                              | ✅ Implementado |
-| 8    | Subida y transcodificación de audio       | ⬜ Pendiente    |
+| 8    | Subida y transcodificación de audio       | ✅ Implementado |
 | 9    | Streaming de audio                        | ⬜ Pendiente    |
 | 10   | Búsqueda                                  | ⬜ Pendiente    |
 | 11   | Recomendaciones precalculadas (Celery)    | ⬜ Pendiente    |
@@ -498,6 +578,62 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   dev-only** que ya vive hardcodeada ahí y en CI desde la Fase 1 — documentado explícitamente para
   que quede claro que no es un descuido de esta fase, no un secreto real.
 
+**Fase 8 — Subida y transcodificación de audio**
+
+- **`boto3` sobre el SDK propio de MinIO**: es el estándar de facto también para servicios
+  S3-compatible (MinIO implementa la API S3), mejor soportado y más conocido que un SDK específico
+  de MinIO — mejor señal de portfolio, y `boto3-stubs[s3]` da tipado real para `mypy --strict`.
+  Timeouts explícitos (`connect_timeout=5, read_timeout=10, retries={"max_attempts": 1}`) en el
+  cliente — ver el bug real de arranque colgado descrito en el Resumen de esta fase.
+- **Validación de audio vía `ffprobe`, nunca el `Content-Type` del multipart**: el header lo declara
+  el cliente y es trivialmente falseable; `ffprobe` intenta parsear el contenido de verdad.
+- **Transcodificación síncrona dentro del request, no Celery**: explícitamente pospuesto a la
+  Fase 11. Riesgo real y documentado (no solo teórico): los endpoints de este proyecto son `def`
+  síncronos (confirmado en `app/api/auth.py`), así que FastAPI los despacha al threadpool
+  compartido de AnyIO (tamaño por defecto ~40) — una subida ocupa un hilo de ese pool durante todo
+  `ffmpeg`/`ffprobe`, y varias subidas concurrentes pueden agotarlo y bloquear temporalmente
+  CUALQUIER otro endpoint síncrono de la app (login, registro, `/2fa/*`), incluida la propia
+  llamada a Redis del rate limiter (que también usa `run_in_threadpool`, Fase 6) — no solo "un
+  worker de uvicorn". Mitigado parcialmente por el límite de 20MB, el `timeout` del subprocess, y
+  el propio rate limiter (60/min general), pero no eliminado.
+- **`subprocess.run([...])` con lista de argumentos, nunca `shell=True`**: sin interpolación de
+  strings no hay inyección de comandos, ni siquiera con un nombre de archivo malicioso (que además
+  nunca se usa para construir rutas, ver el punto de la object key más abajo).
+- **`timeout=` explícito en `ffmpeg`/`ffprobe`** (30s/300s): sin esto, un archivo malformado
+  diseñado para colgar el proceso bloquearía indefinidamente un hilo del pool compartido —
+  agravaría el riesgo de agotamiento de arriba.
+- **Object key del original nunca derivada del nombre de archivo del cliente**: key fija y
+  predecible (`original/{song.id}/source`, sin extensión — `ffmpeg`/`ffprobe` detectan el formato
+  por contenido, no por extensión). Encontrado como hallazgo de seguridad en la revisión del plan.
+- **Creación del bucket una única vez al arrancar, no perezosamente por request**: evita el TOCTOU
+  de dos primeras-subidas concurrentes llamando ambas a `create_bucket` (hallazgo de la revisión
+  Backend/DevOps del plan). El `lifespan` de FastAPI no bloquea el arranque de toda la app si MinIO
+  no responde (fail-open, ver Resumen) — solo `/songs` se vería afectado.
+- **Límite de tamaño (20MB) con alcance parcial honesto, no exagerado**: acota lo que la propia app
+  procesa/persiste/transcodifica y sube a MinIO, pero no evita que Starlette reciba y spoolee a
+  disco el cuerpo completo de una subida enorme antes de que el código de la aplicación pueda
+  cortar (`UploadFile` de alto nivel parsea el multipart completo primero). Una defensa completa
+  exigiría leer el stream crudo de la request a mano — desproporcionado para el alcance de esta
+  fase; mitigación barata añadida: rechazo inmediato si el cliente declara `Content-Length` por
+  encima del límite.
+- **Catálogo público**: cualquier usuario autenticado ve/lista cualquier canción, no solo las
+  propias — más fiel a un clon de Spotify real. Borrar (si existiera) estaría restringido al
+  uploader, pero esta fase no incluye `DELETE` en absoluto (ver Fuera de alcance).
+- **Transacciones DB cortas**: la fila `Song` se crea y comitea (dos commits rápidos: inserción y
+  luego fijar la key con el `id` ya conocido) ANTES de las operaciones lentas de I/O (subida a
+  MinIO, invocación de `ffmpeg`) — no se mantiene una conexión de la pool de Postgres ocupada
+  durante esas operaciones.
+- **Filas atascadas en `status="processing"` si el proceso muere en seco (OOM/kill) entre crear la
+  fila y actualizarla**: riesgo aceptado y documentado, no resuelto en esta fase — no hay ningún
+  mecanismo de reconciliación hasta que exista una cola real (Celery, Fase 11).
+- **`ffmpeg` instalado vía `apt-get` en el `Dockerfile`, no un paquete pip**: no existe como
+  paquete Python; el paquete Debian `ffmpeg` incluye también `ffprobe`. Cuantificado con `docker
+  history`: +467MB a la imagen final (de ~600MB a 1.06GB) — trade-off aceptado, es funcionalidad
+  requerida, no opcional.
+- **Sin `DELETE`/sin presigned URL en esta fase**: decisión explícita del usuario para mantener el
+  alcance de esta fase ceñido a "subir y transcodificar" — servir/descargar el audio es
+  explícitamente Fase 9 (Range Requests, streaming real).
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -561,6 +697,19 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **Base `python:3.12.7-slim-bookworm` pinneada, sin parches de seguridad automáticos** (Fase 7):
   trade-off aceptado por reproducibilidad del build; requiere un bump manual periódico de la
   versión pinneada, no ocurre solo.
+- **Agotamiento del threadpool compartido bajo subidas concurrentes** (Fase 8): todos los endpoints
+  de la app son síncronos y comparten el mismo pool (AnyIO, ~40 hilos por defecto); varias subidas
+  de audio a la vez pueden agotarlo y bloquear temporalmente CUALQUIER otro endpoint, incluida la
+  llamada a Redis del rate limiter. Mitigado parcialmente (límite de tamaño, timeout de subprocess,
+  rate limiter), no eliminado — la solución real es una cola (Celery, Fase 11).
+- **Filas de `Song` atascadas en `status="processing"`** si el proceso muere a mitad del pipeline
+  (Fase 8): sin mecanismo de reconciliación hasta que exista una cola real (Fase 11).
+- **Límite de tamaño de subida (20MB) con alcance parcial** (Fase 8): no evita que Starlette
+  reciba/spoolee a disco el cuerpo completo de una subida enorme antes de que el código de la app
+  pueda cortar — ver Decisiones técnicas, Fase 8, para el detalle y la mitigación parcial aplicada.
+- **Sin límite acumulado de almacenamiento/subidas por usuario** (Fase 8): el límite es solo por
+  request (20MB); combinado con el rate limiter general (60/min), un usuario podría subir hasta
+  ~1.2GB/minuto de forma sostenida. Aceptado para el alcance de portfolio.
 
 ## Cómo escalaría esto en producción real
 

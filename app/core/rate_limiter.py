@@ -99,8 +99,13 @@ _IP_ONLY_ENDPOINTS = {
 }
 
 # Prefijos de API cubiertos por el rate limiter. Todo lo demás (estáticos,
-# /health) no pasa por Redis en absoluto.
-_RATE_LIMITED_PREFIXES = ("/auth/", "/users/", "/2fa/")
+# /health) no pasa por Redis en absoluto. "/songs" va SIN barra final, a
+# diferencia de los otros tres: /auth, /users, /2fa nunca tienen una ruta
+# "pelada" (siempre algo después de la barra), pero /songs sí - POST/GET
+# /songs (la colección) son exactamente ese path, y "/songs".startswith(
+# "/songs/") sería False, dejando la colección sin límite (encontrado por el
+# abogado del diablo en la revisión de esta fase, antes de implementar).
+_RATE_LIMITED_PREFIXES = ("/auth/", "/users/", "/2fa/", "/songs")
 
 
 def _resolve_tier(method: str, path: str) -> Tier | None:
