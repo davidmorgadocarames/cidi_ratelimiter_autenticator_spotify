@@ -209,6 +209,12 @@ def test_verify_lockout_after_five_failed_attempts(client: TestClient) -> None:
         "/2fa/verify", json={"code": real_code}, headers=_headers(access_token)
     )
     assert locked_response.status_code == 429
+    # El detail confirma que este 429 lo dispara el lockout de TOTP (Fase 3,
+    # Postgres) y no el rate limiter genérico de Fase 6 (que en /2fa/verify
+    # está en el tier "general", capacidad 60 - no debería llegar a disparar
+    # con solo 6 requests, pero el test debe demostrarlo, no asumirlo por el
+    # código de estado).
+    assert "Inténtalo de nuevo en" in locked_response.json()["detail"]
 
 
 def test_verify_success_resets_failed_attempts(
@@ -272,6 +278,9 @@ def test_verify_concurrent_wrong_attempts_lockout_not_bypassed(
         "/2fa/verify", json={"code": real_code}, headers=_headers(access_token)
     )
     assert locked_response.status_code == 429
+    # Ver comentario equivalente en test_verify_lockout_after_five_failed_attempts:
+    # el detail distingue el 429 del lockout de TOTP del 429 del rate limiter.
+    assert "Inténtalo de nuevo en" in locked_response.json()["detail"]
 
 
 def test_verify_handles_corrupted_secret_as_controlled_error(

@@ -19,12 +19,13 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-5 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-6 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
-calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit), y CI real
-en GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12). Ver el
+calidad de código local (mypy en modo `--strict`, ruff, black, cobertura, pre-commit), CI real en
+GitHub Actions (tests + lint + type-check en cada PR, matriz de Python 3.10/3.11/3.12), y rate
+limiting con Redis (token bucket) protegiendo login/registro/2FA contra fuerza bruta. Ver el
 roadmap completo abajo y el detalle de qué está implementado vs pendiente en
 [`docs/architecture.md`](docs/architecture.md).
 
@@ -93,6 +94,35 @@ sequenceDiagram
     end
 ```
 
+## Rate limiting con Redis (token bucket)
+
+`POST /auth/login`, `POST /auth/register` y `POST /2fa/setup` (los únicos endpoints sin ninguna
+otra protección propia contra fuerza bruta/credential stuffing) están limitados a 5 requests por
+identidad con refill de 1 cada 12s; el resto de `/auth/*`, `/users/*` y `/2fa/*` tiene un límite
+general de 60/min. La identidad es el `user_id` del access token si la request va autenticada, o
+la IP del cliente si no (login/registro no tienen usuario todavía). Al superarse el límite, la API
+responde `429` con cabeceras `X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset`.
+
+**Por qué Redis y no un contador en memoria del proceso**: un diccionario Python en memoria solo
+sirve mientras haya un único proceso sirviendo requests. En cuanto la API corre con más de un
+worker de `uvicorn`/`gunicorn`, o más de una réplica del contenedor (lo normal en producción, y
+previsto para este proyecto en la Fase 7), cada proceso tendría su propio contador aislado — un
+atacante repartiendo requests entre workers vería un límite efectivo multiplicado por el número de
+procesos, no el límite real. Redis centraliza el estado del bucket en un único lugar que todos los
+procesos comparten, independientemente de cuántos haya.
+
+**Por qué token bucket y no un contador de ventana fija**: un contador simple ("máximo N requests
+por minuto natural") permite ráfagas de hasta 2N requests pegadas al borde entre dos minutos (N al
+final de uno, N al principio del siguiente). El token bucket con refill continuo no tiene ese
+borde: la capacidad se recupera de forma gradual, no de golpe cada minuto.
+
+El estado de cada bucket (tokens disponibles, última vez que se rellenó) se lee, calcula y escribe
+en un único script Lua ejecutado atómicamente por Redis (`EVAL`), evitando que dos requests
+concurrentes de la misma identidad puedan leer el mismo valor antes de que ninguna escriba (el
+mismo tipo de *lost update* que ya apareció y se corrigió en Postgres para la rotación de refresh
+tokens y el lockout de TOTP). Detalle completo del diseño, los dos tiers y el trade-off de
+fail-open en [`docs/architecture.md`](docs/architecture.md).
+
 ## Stack técnico (previsto)
 
 - **Backend**: Python 3 + FastAPI
@@ -130,7 +160,7 @@ sequenceDiagram
 Requiere Python 3.13 en local (única versión instalada en esta máquina). El CI (Fase 5) corre
 además la suite completa contra 3.10/3.11/3.12 en GitHub Actions — verificado en verde en las
 tres, ver [`docs/architecture.md`](docs/architecture.md#riesgos-conocidos). Requiere también
-Docker (para Postgres, adelantado a la Fase 1).
+Docker (para Postgres, adelantado a la Fase 1; y Redis, adelantado a la Fase 6).
 
 ```bash
 python -m venv .venv
@@ -150,12 +180,15 @@ pip install -r requirements.txt
 Copia `.env.example` a `.env` y completa los valores. Desde la Fase 1 son obligatorias:
 `DATABASE_URL`, `TEST_DATABASE_URL`, `JWT_SECRET_KEY` (la app rechaza arrancar con el valor
 placeholder `change-me` — genera uno real con `openssl rand -hex 32`) y `COOKIE_SECURE` (`false`
-en desarrollo local sin HTTPS). El resto de variables se van sumando fase a fase.
+en desarrollo local sin HTTPS). `REDIS_URL` (Fase 6) no es estrictamente obligatoria — tiene
+un valor por defecto (`redis://localhost:6379/0`) sin validador de placeholder, a diferencia de
+`JWT_SECRET_KEY` — pero hay que asegurarse de que apunte al Redis real que se levante. El resto de
+variables se van sumando fase a fase.
 
-Levantar Postgres y aplicar las migraciones antes de correr la API o los tests:
+Levantar Postgres y Redis, y aplicar las migraciones, antes de correr la API o los tests:
 
 ```bash
-docker compose up -d postgres
+docker compose up -d postgres redis
 alembic upgrade head
 uvicorn app.main:app --reload
 # en otra terminal
@@ -191,9 +224,10 @@ activado** en la terminal donde se hace `git commit`, o el hook falla con
 `.github/workflows/ci.yml` corre en cada Pull Request contra `main` (y en cada push a `main`,
 como red de seguridad post-merge): las mismas herramientas de la sección anterior
 (`ruff check`, `black --check`, `mypy app tests`, `pytest --cov=app --cov-fail-under=85`) más
-`alembic upgrade head` contra un Postgres real levantado como servicio del propio job — ahora
-obligatorias en cada PR, no solo un hook local. Matriz de Python `3.10`, `3.11`, `3.12` (el mínimo
-soportado según se documentó desde la Fase 0, no la 3.13 del entorno local).
+`alembic upgrade head` contra un Postgres real y un Redis real (Fase 6), ambos levantados como
+servicios del propio job — ahora obligatorias en cada PR, no solo un hook local. Matriz de Python
+`3.10`, `3.11`, `3.12` (el mínimo soportado según se documentó desde la Fase 0, no la 3.13 del
+entorno local).
 
 **Setup necesario en GitHub antes del primer run** (una sola vez):
 

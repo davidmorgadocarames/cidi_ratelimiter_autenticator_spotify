@@ -104,6 +104,72 @@ scaffolding de agentes hasta ahora): se verificó explícitamente con
 `git log --all --full-history -- .env` que `.env` nunca se trackeó en ninguno de los 5 commits de
 Fases 0-4, antes de hacerlos públicos por primera vez.
 
+**Fase 6 — Rate limiter con Redis (token bucket).** Nuevo `app/core/rate_limiter.py`:
+`RateLimitMiddleware` (`BaseHTTPMiddleware` de Starlette, único middleware de la app, registrado
+en `app/main.py`) que limita `POST /auth/login`, `POST /auth/register` y `POST /2fa/setup` (tier
+`sensitive`: capacidad 5, refill 1/12s) y el resto de `/auth/*`, `/users/*`, `/2fa/*` (tier
+`general`: capacidad 60, refill 1/s). Identidad: `user_id` del access token si la request va
+autenticada (decodificado sin tocar la DB), IP del cliente si no. El estado del bucket
+(`tokens`, `last_refill`) vive en un hash de Redis por identidad, leído/calculado/escrito
+atómicamente en un único script Lua (`EVAL`) — evita el mismo tipo de *lost update* concurrente ya
+corregido en Postgres en Fases 1 y 3. Al superarse el límite, `429` con cabeceras
+`X-RateLimit-Limit`/`X-RateLimit-Remaining`/`X-RateLimit-Reset` (añadidas en toda respuesta que
+pasa por el limiter y sí llega a evaluarse contra Redis, no solo el 429 — **excepto en fail-open**:
+si Redis no responde, `dispatch` retorna antes de construir esas cabeceras, así que una respuesta
+que pasó "gracias" al fail-open no las lleva). Si Redis no responde, la request pasa igual
+(fail-open, ver Decisiones técnicas y Riesgos conocidos).
+
+Nuevo servicio `redis` en `docker-compose.yml` y en `.github/workflows/ci.yml` (mismo patrón que
+`postgres`). 8 tests (`tests/test_rate_limiter.py`) contra Redis real (`FLUSHDB` autouse en
+`tests/conftest.py`, mismo patrón que el `TRUNCATE` de Postgres): cabeceras en requests permitidas,
+bloqueo al superar los tiers `sensitive` y `general`, buckets independientes por identidad,
+identidad por `user_id` y no por IP cuando hay token en un endpoint autenticado, un Bearer propio
+adjuntado a `/auth/login` sigue cayendo en el bucket por IP (regresión del bug de bypass, ver
+abajo), refill simulado manipulando `last_refill` directamente en Redis (sin esperar en tiempo
+real), y fail-open verificado con una `RateLimitMiddleware` aislada apuntando a una URL Redis
+inválida. Los tests de lockout de TOTP ya existentes
+(`test_verify_lockout_after_five_failed_attempts`,
+`test_verify_concurrent_wrong_attempts_lockout_not_bypassed`) se ampliaron para afirmar también el
+`detail` del 429 (`"Inténtalo de nuevo en..."`), no solo el código de estado — demuestra que ese
+429 lo dispara el lockout de TOTP y no el rate limiter genérico.
+
+**Bug real #1, encontrado y corregido durante la implementación**: la primera versión usaba
+`redis.asyncio.Redis`, creado una única vez en `RateLimitMiddleware.__init__` sobre el `app`
+singleton. Ese cliente async queda ligado al event loop activo la primera vez que se usa; en los
+tests, cada `TestClient(app)` (fixture `client`, sin `with` explícito) puede acabar corriendo la
+app ASGI en un event loop distinto, dejando la conexión Redis cacheada huérfana y lanzando
+`RuntimeError: Event loop is closed` en requests posteriores — excepción que el propio `except
+Exception` de fail-open tragaba en silencio, convirtiendo 429 esperados en 401 inesperados en los
+tests. Diagnosticado como riesgo real de arquitectura (no solo un artefacto de test: cualquier
+escenario con más de un event loop activo en el proceso lo dispararía), corregido cambiando a un
+cliente `redis.Redis` **síncrono** despachado vía `starlette.concurrency.run_in_threadpool`, sin
+afinidad a ningún event loop.
+
+**Bug real #2, encontrado en la ronda de revisión Agent Teams posterior a la implementación** (por
+Security y por el abogado del diablo, de forma independiente): `_resolve_identity` usaba
+`user:<sub>` siempre que hubiera un Bearer válido, sin importar el endpoint. Pero `/auth/login` y
+`/auth/register` no usan ese header para autenticar — lo ignoran por completo. Un atacante podía
+adjuntar un access token de una cuenta propia a sus intentos de login contra una víctima y así
+mover ese tráfico del bucket `ip:<atacante>` a un bucket `user:<atacante>` aparte; registrando N
+cuentas conseguía N buckets `sensitive` independientes contra el mismo endpoint, amplificando por
+N el límite que ese tier existe para imponer — precisamente el vector de fuerza bruta que esta
+fase debía cerrar, y en contradicción directa con el diseño documentado ("por IP del cliente" para
+login/registro). Corregido forzando identidad por IP (`force_ip=True`, ignorando cualquier Bearer)
+específicamente para `POST /auth/login` y `POST /auth/register` (`_IP_ONLY_ENDPOINTS` en
+`app/core/rate_limiter.py`) — `/2fa/setup`, el tercer endpoint `sensitive`, sí exige autenticación
+real para llegar al handler, así que ahí bucketear por `user_id` sigue siendo correcto y
+deliberado. Cubierto por
+`tests/test_rate_limiter.py::test_login_with_bearer_token_still_rate_limited_by_ip`.
+
+**Corrección adicional de la misma ronda de revisión** (Security y Backend, de forma
+independiente): el `except Exception` de fail-open envolvía también el parseo del resultado del
+script Lua (`int(result[0])`, `float(result[1])`), no solo la llamada a Redis. Un bug de
+programación propio en esa ruta (ej. un cambio futuro en lo que devuelve el Lua) se habría
+enmascarado como "Redis caído" y degradado en silencio a fail-open, en vez de fallar de forma
+visible. Corregido estrechando el `except` a `redis.RedisError` únicamente alrededor de la llamada
+a Redis (`run_in_threadpool`); el parseo, fuera del `try`, ahora sí propagaría como error real si
+algo cambiara ahí.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -122,7 +188,7 @@ proyecto de portfolio).
 | 3    | 2FA (TOTP)                                | ✅ Implementado |
 | 4    | Calidad de código local                   | ✅ Implementado |
 | 5    | CI                                        | ✅ Implementado |
-| 6    | Rate limiter con Redis                    | ⬜ Pendiente    |
+| 6    | Rate limiter con Redis                    | ✅ Implementado |
 | 7    | Contenedores                              | ⬜ Pendiente    |
 | 8    | Subida y transcodificación de audio       | ⬜ Pendiente    |
 | 9    | Streaming de audio                        | ⬜ Pendiente    |
@@ -273,6 +339,55 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   verdad contra la matriz de Python antes de mergear — la primera demostración real de que
   funciona, no solo de que la sintaxis del YAML es válida.
 
+**Fase 6 — Rate limiter con Redis**
+
+- **Token bucket, no ventana fija**: refill continuo evita el efecto de ráfaga doble en el borde
+  entre dos ventanas (hasta 2N requests pegadas al minuto natural con un contador simple). Detalle
+  y comparación en el README (sección "Rate limiting con Redis").
+- **Script Lua atómico (`EVAL`), no varias llamadas Redis separadas**: lectura + cálculo de refill
+  + decremento + escritura en un único paso serializado por Redis, mismo motivo que
+  `SELECT ... FOR UPDATE` en Postgres (Fases 1 y 3) — sin esto, dos requests concurrentes de la
+  misma identidad podrían leer el mismo `tokens` antes de que ninguna escriba.
+- **Dos tiers (`sensitive`/`general`), no un límite uniforme**: un único límite no protege de
+  verdad login/registro/2FA-setup (habría que ponerlo muy bajo, molestando el uso normal de la
+  API) ni tiene sentido ser igual de estricto en endpoints que no son objetivo de fuerza bruta.
+- **`/2fa/verify` y `/users/me/premium/activate` en el tier `general`, no `sensitive`, pese a ser
+  sensibles**: ya tienen el lockout de TOTP de la Fase 3 (5 intentos → 15 min en Postgres), más
+  estricto que cualquier tier de este rate limiter. Aplicarles además el tier `sensitive` haría
+  que el 429 del middleware (segundos de reset, mensaje genérico) se disparase antes que el 429
+  del lockout (minutos de reset, mensaje específico) — dos relojes y mensajes distintos según cuál
+  gane la carrera. Con capacidad 60 en `general`, el lockout (dispara a los 5 intentos) siempre
+  actúa primero.
+- **`/auth/refresh` en `general`, no `sensitive`**: el refresh token es aleatorio de 256 bits
+  (`secrets.token_urlsafe(32)`), no adivinable por fuerza bruta bajo ningún límite de rate
+  razonable — su protección real es la entropía más la detección de reuso (Fase 1), no el rate
+  limiting.
+- **Identidad por `user_id` (del JWT, sin tocar la DB) o IP si no hay token — EXCEPTO en
+  `/auth/login` y `/auth/register`, siempre por IP**: protege también los endpoints públicos
+  (login, registro, 2FA antes de confirmar) donde todavía no hay usuario. La excepción no es
+  cosmética: login/registro no leen el header `Authorization` para autenticar, así que un Bearer
+  adjuntado ahí no prueba nada sobre quién hace la request — ver el bug real #2 descrito en el
+  Resumen de esta fase (encontrado en la ronda de revisión Agent Teams, no en el diseño inicial).
+  **Asunción explícita** sobre el fallback a IP: no hay proxy inverso delante de la API en este
+  despliegue, así que `request.client.host` es la IP real de la conexión TCP — el código no lee
+  `X-Forwarded-For` (no falsificable hoy). El día que se ponga un proxy/CDN delante (Fase 9/15),
+  todas las conexiones se verían con la IP del proxy, fusionando buckets de usuarios distintos;
+  fuera de alcance de esta fase, documentado como asunción a revisitar, no como bug.
+- **Fail-open si Redis no responde**: la request pasa igual (se loguea el fallo), prioriza
+  disponibilidad sobre bloquear toda la API por una caída de infraestructura. No es solo un riesgo
+  operacional — ver el escenario de ataque explícito en Riesgos conocidos. Se decidió no
+  implementar un fallback de lockout en Postgres independiente de Redis para login/registro:
+  duplicaría el propósito de esta fase y añadiría alcance significativo fuera de lo pedido.
+- **`BaseHTTPMiddleware`, no ASGI puro**: los problemas conocidos de `BaseHTTPMiddleware` (pérdida
+  de `request.state`, manejo de excepciones al encadenar con otros middlewares) aplican sobre todo
+  con varios middlewares interactuando — aquí es el único de la app. El patrón
+  `dispatch(request, call_next)` es sustancialmente más simple de escribir/testear que ASGI puro
+  para esta lógica. Revisar si conviene migrar cuando se añadan más middlewares (ej. CORS si se
+  separa el frontend en una fase futura).
+- **Cliente Redis síncrono + `run_in_threadpool`, no `redis.asyncio`**: ver el bug real descrito en
+  el Resumen de esta fase — un cliente async queda ligado al event loop en el que se usa por
+  primera vez, riesgo real de arquitectura, no solo un artefacto de tests.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -286,9 +401,8 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   podrían resolver versiones transitivas distintas — es el punto más probable donde el desfase de
   versión de Python muerda de verdad. Revisar en Fase 4/5 si conviene un lockfile
   (`pip-compile`, `uv lock` o similar).
-- **Sin rate limiting en `/auth/login` ni `/auth/register`**: pospuesto explícitamente a la Fase 6
-  (rate limiter con Redis). Hasta entonces, ambos endpoints son vulnerables a fuerza bruta /
-  credential stuffing sin fricción.
+- ~~Sin rate limiting en `/auth/login` ni `/auth/register`~~ — **resuelto en Fase 6**: tier
+  `sensitive` del rate limiter (capacidad 5, refill 1/12s) por IP del cliente.
 - **`/auth/register` permite enumerar emails registrados** (responde 409 explícito si el email ya
   existe), a diferencia de `/auth/login` que sí es cuidadoso (401 genérico + timing equalizado
   tanto si el email no existe como si la contraseña es incorrecta). Aceptado como limitación
@@ -301,9 +415,17 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **Pérdida o rotación de `TOTP_ENCRYPTION_KEY`**: deja indescifrables todos los secretos TOTP ya
   guardados, forzando a reconfigurar 2FA a todos los usuarios existentes. No hay estrategia de
   rotación de clave en esta fase (aceptado para el alcance de un portfolio).
-- **El lockout de TOTP es ad-hoc y por-usuario, no un rate limiter general**: protege contra
-  fuerza bruta contra UNA cuenta, pero no contra un atacante que reparta intentos entre muchas
-  cuentas distintas a la vez — eso sí necesita el rate limiter real de Fase 6 (Redis).
+- ~~El lockout de TOTP es ad-hoc y por-usuario, no un rate limiter general~~ — **resuelto en
+  Fase 6**: el rate limiter general (tier `general`, capacidad 60/min por identidad) cubre además
+  el caso de un atacante repartiendo intentos entre muchas cuentas distintas a la vez; el lockout
+  de Postgres sigue siendo la protección primaria por-cuenta, más estricta.
+- **Fail-open del rate limiter como escenario de ataque, no solo riesgo operacional**: para
+  `/auth/login` y `/auth/register` (sin ningún otro control además de este rate limiter — a
+  diferencia de `/2fa/verify`/`/premium/activate`, que además tienen el lockout de Postgres), un
+  atacante que consiga saturar o tumbar Redis elimina de un plumazo la única protección contra
+  fuerza bruta de esos dos endpoints, sin que la API deje de responder (justo lo que fail-open
+  prioriza). Aceptado explícitamente para el alcance de este proyecto — ver la justificación
+  completa en Decisiones técnicas, Fase 6.
 - **No hay endpoint para desactivar 2FA una vez confirmado**: limitación conocida, fuera de
   alcance de esta fase (no lo pedía el enunciado). Un usuario que pierde su dispositivo
   autenticador no tiene forma de recuperar acceso a la activación de premium sin intervención
@@ -312,8 +434,8 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   el `mypy` del `PATH` de quien commitea. Si el venv no está activado (otra terminal, GUI de git),
   el hook falla con `Executable 'mypy' not found` en vez de correr una versión distinta en
   silencio — falla ruidoso, no silencioso, pero sigue siendo fricción a documentar (ver README).
-- **`pytest-cov` sin umbral obligatorio**: nada impide bajar del 94% actual en una fase futura sin
-  que ningún check lo bloquee, hasta que se fije `--cov-fail-under` en Fase 5.
+- ~~`pytest-cov` sin umbral obligatorio~~ — **resuelto en Fase 5**: `--cov-fail-under=85` en CI
+  (esta entrada quedó sin actualizar hasta la revisión de documentación de la Fase 6).
 
 ## Cómo escalaría esto en producción real
 
