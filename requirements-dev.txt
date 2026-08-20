@@ -14,3 +14,6 @@ pre-commit==4.0.1
 # Fase 8: stubs de boto3 para mypy --strict (boto3/botocore no publican tipos
 # inline) - solo el subconjunto "s3" que usa el proyecto
 boto3-stubs[s3]==1.43.75
+
+# Fase 11: stubs de celery para mypy --strict (celery tampoco publica py.typed)
+celery-types==0.26.0

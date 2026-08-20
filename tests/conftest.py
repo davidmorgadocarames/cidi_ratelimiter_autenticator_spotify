@@ -16,7 +16,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import settings
 from app.db.session import Base, get_db
 from app.main import app
-from app.models import song, user  # noqa: F401 - registra los modelos en Base.metadata
+from app.models import (  # noqa: F401 - registra los modelos en Base.metadata
+    play,
+    song,
+    user,
+)
 from app.services.search import _INDEX_NAME, ensure_index_exists
 from app.services.storage import ensure_bucket_exists
 
@@ -98,7 +102,10 @@ def _clean_index() -> Generator[None, None, None]:
 def _clean_tables() -> Generator[None, None, None]:
     with test_engine.begin() as conn:
         conn.execute(
-            text("TRUNCATE users, refresh_tokens, songs RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE users, refresh_tokens, songs, song_plays "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     yield
 

@@ -389,6 +389,51 @@ bloquea la subida, y Meilisearch caído al buscar (monkeypatch de `search_songs`
 Verificado también manualmente con `curl` real contra el stack dockerizado completo (subida +
 búsqueda inmediata).
 
+**Fase 11 — Recomendaciones precalculadas (Celery).** Nueva tabla `song_plays` (Postgres, log de
+eventos append-only, sin UNIQUE — repetir una canción es señal más fuerte, no un duplicado) y nuevo
+módulo `app/services/recommendations.py`: `fetch_ready_songs`/`fetch_play_aggregates` consultan
+Postgres **una sola vez por ciclo** (no una vez por usuario — ver más abajo),
+`rank_recommendations_for_user` es una función **pura** en memoria (afinidad por artista, fallback a popularidad global,
+fallback final a más recientes), y `store_recommendations`/`get_recommendations` leen/escriben
+Redis. Nuevo `app/worker.py`: app de Celery (broker en `redis://.../1`, DB separada de la que ya
+usa el rate limiter) con Beat programado cada 5 min, y la tarea `recompute_all_recommendations` que
+recorre todos los usuarios. Nuevo endpoint `GET /users/me/recommendations` (`app/api/users.py`) —
+lectura barata contra Redis, nunca calcula nada en vivo. `GET /songs/{id}/stream` (`app/api/songs.py`)
+gana un insert best-effort en `song_plays` (nunca bloquea el streaming si falla).
+
+**Rediseño durante la revisión del plan, no un ajuste cosmético**: el diseño original hacía la
+agregación de popularidad dentro de una función por-usuario, así que `recompute_all_recommendations`
+la repetía una vez por cada usuario — degradaba linealmente con el número de usuarios y el tamaño
+de `song_plays`. Se separó en **fetch** (una query total por ciclo, agregada en Python a tres
+diccionarios: afinidad por artista, canciones ya reproducidas, plays globales) y **ranking** (función
+pura sin Postgres, testeable con estructuras en memoria). También de la revisión: un lock corto en
+Redis (`SETNX`-style) contra pases solapados si Beat alguna vez disparara antes de que termine el
+anterior; el engine de Postgres del worker se crea **dentro** de la tarea, no a nivel de módulo —
+`celery worker` usa el pool `prefork` (`fork()`) por defecto, y un engine creado en el proceso padre
+comparte sockets de conexión corruptos entre los hijos (footgun conocido de Celery+SQLAlchemy); y
+`docker-compose.yml` sobreescribe el `entrypoint:` de `celery-worker`/`celery-beat` a `["celery"]`
+(no el `docker/entrypoint.sh` de `app`, que migra) para no disparar tres migraciones concurrentes en
+cada `docker compose up` — en su lugar dependen de `app: condition: service_healthy` como señal de
+"las migraciones ya están aplicadas".
+
+**Encontrado en implementación, no en la revisión del plan**: `_run_recompute` (la lógica real,
+separada del wrapper `@celery_app.task`) recibe la URL de la base de datos como parámetro — si los
+tests llamaran directo a la task decorada, crearía su propio engine contra `settings.database_url`
+(producción/dev), no `settings.test_database_url`, tocando la base equivocada. Esta separación
+permite a los tests pasar `settings.test_database_url` explícitamente.
+
+16 tests nuevos en `tests/test_recommendations.py`: `rank_recommendations_for_user` con estructuras
+en memoria (afinidad, exclusión de ya reproducidas, ambos fallbacks, límite), `fetch_ready_songs`/
+`fetch_play_aggregates` contra Postgres real, `store_recommendations`/`get_recommendations` contra
+Redis real, `_run_recompute` completo contra Postgres/Redis reales de test (sin `.delay()`, sin
+broker), una aserción barata de que el nombre de la task en `beat_schedule` coincide con una task
+realmente registrada (`celery_app.tasks`), el endpoint `GET /users/me/recommendations` (vacío antes
+del primer ciclo, orden preservado, `401`), y el registro de plays en `GET /songs/{id}/stream`
+(incluyendo que un fallo del insert no rompe el streaming). Verificado también manualmente contra
+el stack dockerizado completo: `celery-worker`/`celery-beat` conectan al broker real
+(`redis://redis:6379/1`, confirmado en logs), un `celery -A app.worker call ...` manual dispara la tarea real
+y las recomendaciones aparecen en Redis y en el endpoint.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -412,7 +457,7 @@ proyecto de portfolio).
 | 8    | Subida y transcodificación de audio       | ✅ Implementado |
 | 9    | Streaming de audio                        | ✅ Implementado |
 | 10   | Búsqueda                                  | ✅ Implementado |
-| 11   | Recomendaciones precalculadas (Celery)    | ⬜ Pendiente    |
+| 11   | Recomendaciones precalculadas (Celery)    | ✅ Implementado |
 | 12   | Caché de contenido popular                | ⬜ Pendiente    |
 | 13   | Sincronización entre dispositivos         | ⬜ Pendiente    |
 | 14   | CD                                        | ⬜ Pendiente    |
@@ -676,8 +721,10 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   cliente — ver el bug real de arranque colgado descrito en el Resumen de esta fase.
 - **Validación de audio vía `ffprobe`, nunca el `Content-Type` del multipart**: el header lo declara
   el cliente y es trivialmente falseable; `ffprobe` intenta parsear el contenido de verdad.
-- **Transcodificación síncrona dentro del request, no Celery**: explícitamente pospuesto a la
-  Fase 11. Riesgo real y documentado (no solo teórico): los endpoints de este proyecto son `def`
+- **Transcodificación síncrona dentro del request, no Celery**: explícitamente pospuesto. La
+  Fase 11 SÍ introdujo Celery, pero acotado a recomendaciones (decisión explícita del usuario, ver
+  esa sección) — este riesgo sigue sin resolver, pendiente de una fase futura. Riesgo real y
+  documentado (no solo teórico): los endpoints de este proyecto son `def`
   síncronos (confirmado en `app/api/auth.py`), así que FastAPI los despacha al threadpool
   compartido de AnyIO (tamaño por defecto ~40) — una subida ocupa un hilo de ese pool durante todo
   `ffmpeg`/`ffprobe`, y varias subidas concurrentes pueden agotarlo y bloquear temporalmente
@@ -713,8 +760,9 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   MinIO, invocación de `ffmpeg`) — no se mantiene una conexión de la pool de Postgres ocupada
   durante esas operaciones.
 - **Filas atascadas en `status="processing"` si el proceso muere en seco (OOM/kill) entre crear la
-  fila y actualizarla**: riesgo aceptado y documentado, no resuelto en esta fase — no hay ningún
-  mecanismo de reconciliación hasta que exista una cola real (Celery, Fase 11).
+  fila y actualizarla**: riesgo aceptado y documentado, no resuelto en esta fase — la Fase 11
+  introdujo Celery pero acotado a recomendaciones, sin mecanismo de reconciliación para este
+  pipeline, pendiente de una fase futura.
 - **`ffmpeg` instalado vía `apt-get` en el `Dockerfile`, no un paquete pip**: no existe como
   paquete Python; el paquete Debian `ffmpeg` incluye también `ffprobe`. Cuantificado con `docker
   history`: +467MB a la imagen final (de ~600MB a 1.06GB) — trade-off aceptado, es funcionalidad
@@ -818,6 +866,81 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   catálogo (`GET /songs` y `GET /songs/search`) muestren conjuntos distintos de canciones sin
   explicación.
 
+**Fase 11 — Recomendaciones precalculadas (Celery)**
+
+- **Alcance acotado solo a recomendaciones, decisión explícita del usuario**: pese a que varios
+  comentarios de fases anteriores decían "hasta que exista Celery (Fase 11)" refiriéndose al
+  pipeline de subida de audio, esta fase NO lo tocó — la subida sigue síncrona, esos riesgos
+  siguen sin resolver (ver Riesgos conocidos). Evita duplicar dos refactors grandes en una sola
+  fase.
+- **Algoritmo de afinidad por artista + fallback a popularidad + fallback a más recientes, no un
+  ranking global simple**: decisión explícita del usuario para no solapar conceptualmente con la
+  futura Fase 12 (caché de contenido popular, que sí sería un ranking global tipo trending).
+  Heurística de conteo simple, documentada como tal — no collaborative filtering ni ML.
+- **Rediseño de una sola query agregada por ciclo, no por usuario**: el diseño original de la
+  revisión del plan llamaba una función que hacía sus propias queries a `song_plays` por cada
+  usuario dentro de `recompute_all_recommendations` — la agregación de popularidad global se
+  repetía N veces (N = número de usuarios), degradando linealmente. Se separó en
+  `fetch_ready_songs`/`fetch_play_aggregates` (una query cada una, una vez por ciclo, agregadas en
+  Python a tres diccionarios) y `rank_recommendations_for_user` (función pura sin Postgres, opera solo
+  sobre las estructuras ya cargadas en memoria).
+- **Recomendaciones en Redis, historial de plays en Postgres**: coherente con "Celery + Redis" ya
+  anunciado en el stack del README, y con el patrón ya establecido de que el estado
+  derivado/regenerable vive en Redis (buckets del rate limiter) mientras los datos fuente viven en
+  Postgres. Redis solo guarda IDs, no objetos completos (a diferencia de Meilisearch en la Fase
+  10, que cachea documentos completos porque su trabajo ES la búsqueda) — el endpoint re-consulta
+  Postgres por esos IDs (barato, ≤20 filas) y reordena en Python según el orden de Redis, lo que
+  además auto-sana si algún día existe borrado de canciones.
+- **Broker de Celery en una DB de Redis separada (`.../1`) de la que usa el rate limiter
+  (`.../0`)**: evita que el `flushdb()` autouse de los tests, o un futuro flush operacional de los
+  buckets del rate limiter, se lleve por delante el estado interno de la cola de Celery.
+- **Sin result backend configurado**: nada llama a `.get()` sobre el resultado de
+  `recompute_all_recommendations` (Beat la dispara, el efecto es la escritura a Redis) — un
+  backend sería una pieza más sin ningún consumidor.
+- **Lock corto en Redis contra pases solapados, con liberación atómica (token + compare-and-delete,
+  no un `DEL` incondicional)**: Celery Beat no deduplica ejecuciones solapadas por sí solo — sin el
+  lock, un pase que alguna vez tardara más que el intervalo de 5 min acumularía un backlog
+  creciente sobre el mismo worker. Mitigado también por el rediseño de fetch único (un pase es
+  rápido incluso con cientos de usuarios). **Corregido en la revisión post-implementación**: la
+  primera versión adquiría el lock con un valor constante y lo liberaba con `DEL` incondicional en
+  el `finally` — si un pase excedía el TTL (240s) antes de que Beat disparara el siguiente ciclo
+  (300s), el lock expiraba solo, un pase nuevo lo adquiría, y el pase viejo (al terminar) borraba
+  ese lock ajeno en vez del suyo — rompía justo la exclusión mutua que el lock prometía. Corregido
+  con un token único (`uuid4` por ejecución) y un script Lua de compare-and-delete (mismo patrón
+  atómico que el rate limiter, `app/core/rate_limiter.py`) que solo borra el lock si el valor
+  todavía coincide con el token de esa ejecución.
+- **Engine de Postgres del worker creado dentro de la tarea, no a nivel de módulo** (hallazgo de la
+  revisión del plan): `celery worker` usa el pool `prefork` (`fork()`) por defecto — un engine
+  SQLAlchemy creado en el proceso padre antes del fork comparte sockets de conexión corruptos
+  entre los procesos hijo, footgun conocido de Celery+SQLAlchemy. Crearlo perezosamente dentro de
+  la tarea evita el problema sin wiring de señales de Celery (`worker_process_init`) — aceptable
+  porque la tarea corre cada 5 min, no por request.
+- **`_run_recompute` recibe la URL de la base de datos como parámetro** (encontrado en
+  implementación, no en la revisión del plan): la versión inicial de la tarea decorada creaba su
+  engine contra `settings.database_url` directamente — si los tests la llamaran así, tocarían la
+  base de producción/dev, no `settings.test_database_url`. Separar la lógica real
+  (`_run_recompute(database_url)`) del wrapper `@celery_app.task` permite a los tests pasar la URL
+  de test explícita.
+- **`docker-compose.yml`: `celery-worker`/`celery-beat` sobreescriben `entrypoint:` a `["celery"]`**,
+  no heredan el `docker/entrypoint.sh` de `app` (que corre `alembic upgrade head`) — si lo
+  heredaran, cada `docker compose up` dispararía tres migraciones concurrentes contra la misma
+  Postgres, agravando de inmediato un riesgo hoy solo teórico (ver Riesgos conocidos, Fase 7).
+  Dependen de `app: condition: service_healthy` como señal de "las migraciones ya están
+  aplicadas", sin duplicar esa lógica en tres sitios.
+- **`GET /songs/{id}/stream` registra el play de forma best-effort, no bloqueante** (hallazgo de la
+  revisión del plan): la primera versión del diseño hacía el insert+commit de forma bloqueante,
+  razonando que "si Postgres no responde el endpoint ya fallaría igual" — falso dilema, un fallo
+  específico de esa escritura (deadlock, serialization failure) con las lecturas funcionando bien
+  degradaría una función núcleo (reproducir audio) por una señal de analítica. Corregido con
+  `try/except`, mismo patrón que `index_song` de la Fase 10.
+- **CI**: `test` no levanta un broker real — llama `fetch_ready_songs`/`fetch_play_aggregates`/
+  `rank_recommendations_for_user`/`_run_recompute` directo contra Postgres/Redis reales. La única
+  cobertura automatizada de la ruta real CLI→broker→worker→Redis vive en el job `docker`: arranca
+  `celery-worker` con la misma imagen (`entrypoint`/`command` de Celery), confirma en los logs que
+  conectó al broker de verdad (no solo que el proceso siga vivo — un worker sin broker reintenta
+  con backoff indefinidamente en vez de salir, dando falso positivo), dispara la tarea real, y hace
+  polling sobre Redis hasta ver aparecer una clave `recommendations:*`.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -885,9 +1008,10 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   de la app son síncronos y comparten el mismo pool (AnyIO, ~40 hilos por defecto); varias subidas
   de audio a la vez pueden agotarlo y bloquear temporalmente CUALQUIER otro endpoint, incluida la
   llamada a Redis del rate limiter. Mitigado parcialmente (límite de tamaño, timeout de subprocess,
-  rate limiter), no eliminado — la solución real es una cola (Celery, Fase 11).
+  rate limiter), no eliminado — la Fase 11 introdujo Celery pero acotado a recomendaciones
+  (decisión explícita del usuario), este pipeline sigue síncrono, pendiente de una fase futura.
 - **Filas de `Song` atascadas en `status="processing"`** si el proceso muere a mitad del pipeline
-  (Fase 8): sin mecanismo de reconciliación hasta que exista una cola real (Fase 11).
+  (Fase 8): sin mecanismo de reconciliación, mismo motivo que el punto anterior.
 - **Límite de tamaño de subida (20MB) con alcance parcial** (Fase 8): no evita que Starlette
   reciba/spoolee a disco el cuerpo completo de una subida enorme antes de que el código de la app
   pueda cortar — ver Decisiones técnicas, Fase 8, para el detalle y la mitigación parcial aplicada.
@@ -922,8 +1046,9 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   `GET /songs`) hasta una reindexación manual futura.
 - **Sin reconciliación automática si la indexación falla** (Fase 10): si `index_song` falla (best
   effort, ver Decisiones técnicas), no hay retry ni cola que reintente más tarde — la canción queda
-  reproducible pero invisible a la búsqueda hasta que exista una cola real (Celery, Fase 11), mismo
-  principio que las filas atascadas en `status="processing"` de la Fase 8.
+  reproducible pero invisible a la búsqueda. La Fase 11 introdujo Celery pero acotado a
+  recomendaciones (ver esa sección), este gap sigue sin resolver, mismo principio que las filas
+  atascadas en `status="processing"` de la Fase 8.
 - **Meilisearch de un único nodo, sin réplica** (Fase 10): mismo riesgo ya aceptado para
   Postgres/MinIO en fases anteriores — sin alta disponibilidad, aceptado para el alcance de un
   proyecto de portfolio.
@@ -931,6 +1056,32 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   contra infraestructura real (ver Decisiones técnicas) — protegido únicamente por la master key
   (`MEILISEARCH_API_KEY`), sin capa de red adicional. Mismo nivel de exposición que Postgres/Redis/
   MinIO, que ya publican sus puertos por el mismo motivo.
+- **La subida de audio sigue síncrona** (Fase 11): pese a que Celery ya existe en el proyecto desde
+  esta fase, el alcance se acotó explícitamente a recomendaciones (decisión del usuario) — el
+  agotamiento del threadpool bajo subidas concurrentes y las filas `status="processing"` atascadas
+  (Fase 8) siguen sin resolver, pendientes de una fase futura.
+- **`recompute_all_recommendations` recorre TODOS los usuarios en cada ciclo, sin recálculo
+  incremental** (Fase 11): mitigado por el rediseño de una sola query agregada por ciclo (no
+  escala con `song_plays` × usuarios), pero sigue siendo O(usuarios) por ciclo — límite de escala
+  real para un número de usuarios muy grande, aceptado para el alcance de portfolio.
+- **La señal de "play" es un proxy, no una escucha confirmada, y no tiene deduplicación** (Fase 11):
+  `GET /songs/{id}/stream` registra "el usuario pidió esta URL", no "escuchó la canción completa" —
+  no hay UI de reproducción en este proyecto (Fase 9). Sin deduplicación ni throttle específico más
+  allá del tier `general` del rate limiter, un usuario podría inflar el conteo de reproducciones de
+  una canción propia repitiendo la request, lo que además contamina el fallback de popularidad
+  *global* que ven otros usuarios. Aceptado, documentado, sin gobierno adicional (hallazgo de la
+  revisión del plan).
+- **Registro de plays best-effort: puede perderse silenciosamente** (Fase 11): si el insert en
+  `song_plays` falla, se loguea y no se reintenta — esa reproducción concreta no contribuirá a
+  futuras recomendaciones, sin que el usuario lo note (el streaming sigue funcionando igual).
+- **Sin backfill de recomendaciones para usuarios ya existentes hasta el primer ciclo de Beat**
+  (Fase 11): un usuario registrado justo antes de desplegar esta fase ve `GET
+  /users/me/recommendations` vacío hasta que Beat corra su primer ciclo (máximo 5 min) — estado
+  normal y documentado, no un error.
+- **`celery-worker`/`celery-beat` sin réplicas, un único worker** (Fase 11): mismo criterio ya
+  aceptado para `app`/Postgres/MinIO — sin alta disponibilidad, aceptado para el alcance de un
+  proyecto de portfolio. El lock de Redis contra pases solapados no fue diseñado para coordinar
+  múltiples workers, solo para evitar que el mismo worker acumule pases pendientes.
 
 ## Cómo escalaría esto en producción real
 

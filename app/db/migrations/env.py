@@ -5,7 +5,11 @@ from sqlalchemy import engine_from_config, pool
 
 from app.core.config import settings
 from app.db.session import Base
-from app.models import song, user  # noqa: F401 - registra los modelos en Base.metadata
+from app.models import (  # noqa: F401 - registra los modelos en Base.metadata
+    play,
+    song,
+    user,
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

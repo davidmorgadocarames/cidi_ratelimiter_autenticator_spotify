@@ -4,6 +4,7 @@
 #   - app                     -> Fase 7 (la API dockerizada; stack completo)
 #   - minio                   -> Fase 8 (almacenamiento de audio, compatible S3)
 #   - meilisearch              -> Fase 10 (búsqueda de canciones)
+#   - celery-worker/celery-beat -> Fase 11 (recomendaciones precalculadas)
 # (Sin clave `version:` - está deprecada en Compose v2.)
 
 services:
@@ -132,6 +133,79 @@ services:
       timeout: 3s
       retries: 3
       start_period: 10s
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+
+  celery-worker:
+    build: .
+    restart: unless-stopped
+    # NO el docker/entrypoint.sh de "app" (que corre "alembic upgrade head"
+    # antes de cualquier CMD): si este servicio lo heredara sin cambios, cada
+    # "docker compose up" dispararía TRES migraciones concurrentes (app +
+    # worker + beat) contra la misma Postgres, agravando de inmediato un
+    # riesgo hoy solo teórico (docs/architecture.md: "migraciones automáticas
+    # no soportan réplicas concurrentes"). "app: condition: service_healthy"
+    # en depends_on de abajo sirve como señal fiable de "las migraciones ya
+    # están aplicadas" sin duplicar esa lógica aquí.
+    entrypoint: ["celery"]
+    command: ["-A", "app.worker", "worker", "--loglevel=info"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://user:password@postgres:5432/spotify_clone
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    healthcheck:
+      # A verificar empíricamente en implementación (mismo criterio aplicado a
+      # MinIO/Meilisearch): no asumir que "celery inspect ping" funciona tal
+      # cual sin probarlo dentro del contenedor real.
+      test: ["CMD", "celery", "-A", "app.worker", "inspect", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - "ALL"
+
+  celery-beat:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["celery"]
+    command: ["-A", "app.worker", "beat", "--loglevel=info"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://user:password@postgres:5432/spotify_clone
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+    # Deshabilitado explícitamente (no simplemente omitido): sin esto, Compose
+    # hereda el HEALTHCHECK del Dockerfile (golpea http://localhost:8000/health,
+    # el puerto que sirve "app") - "celery beat" no expone ningún HTTP, así que
+    # esa sonda heredada fallaría siempre y marcaría el contenedor "unhealthy"
+    # aunque esté funcionando perfectamente (encontrado empíricamente: sin este
+    # "disable: true" el contenedor queda "unhealthy" de forma permanente).
+    # "celery inspect ping" tampoco sirve aquí (no responde para un proceso
+    # beat, que no consume tareas) y no hay ningún otro endpoint de salud nativo
+    # - el TTL de 15min de las recomendaciones en Redis es la red de seguridad
+    # si beat muere.
+    healthcheck:
+      disable: true
     security_opt:
       - "no-new-privileges:true"
     cap_drop:

@@ -15,9 +15,12 @@ class Song(Base):
     uploaded_by_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    # "pending" reservado para cuando haya cola async (Fase 11, Celery) - hoy el
-    # flujo es síncrono dentro del propio request, así que una fila nueva nace
-    # directamente en "processing" (nunca se observa un "pending" real todavía).
+    # "pending" reservado para cuando la subida pase a ser async - la Fase 11
+    # introdujo Celery pero acotado a recomendaciones (decisión explícita del
+    # usuario, ver docs/architecture.md), la subida sigue síncrona dentro del
+    # propio request, así que una fila nueva nace directamente en "processing"
+    # (nunca se observa un "pending" real todavía, sigue pendiente de una
+    # fase futura).
     status: Mapped[str] = mapped_column(
         String(20), default="processing", server_default="processing", nullable=False
     )
