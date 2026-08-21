@@ -19,7 +19,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-11 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-12 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -30,8 +30,9 @@ completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados co
 postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` + MinIO) con un
 catálogo público de canciones, streaming real con Range Requests vía URLs firmadas de MinIO
 (control plane/data plane), búsqueda de canciones por título/artista con Meilisearch, y
-recomendaciones precalculadas por afinidad de artista con Celery. Ver el roadmap completo abajo y
-el detalle de qué está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
+recomendaciones precalculadas por afinidad de artista con Celery, y un ranking global de contenido
+popular cacheado en Redis (cache-aside con TTL). Ver el roadmap completo abajo y el detalle de qué
+está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
@@ -195,6 +196,18 @@ docker compose exec celery-worker celery -A app.worker call app.worker.recompute
 Decisiones completas (por qué Redis para el resultado pero Postgres para la señal fuente, el lock
 contra pases solapados, por qué el engine de Postgres del worker se crea de forma perezosa, y los
 riesgos aceptados) en [`docs/architecture.md`](docs/architecture.md).
+
+## Contenido popular (Fase 12)
+
+`GET /songs/popular?limit=` devuelve el ranking global de canciones más reproducidas — la misma
+lista para cualquier usuario, sin personalización (a diferencia de `GET /users/me/recommendations`
+de la Fase 11). Técnica de caché deliberadamente distinta a la de esa fase: **cache-aside clásico
+con TTL** (5 min), no otra tarea de Celery Beat — el ranking se calcula bajo demanda en el primer
+request que encuentra el caché vacío o expirado (una única query agregada sobre `song_plays`), se
+guarda en Redis, y las requests siguientes leen directo del caché hasta que expire. Sin lock contra
+cache-stampede (riesgo aceptado y documentado: bajo concurrencia justo al expirar, varias requests
+podrían recalcular a la vez — mismo resultado, solo trabajo duplicado, no incorrecto). Decisiones
+completas en [`docs/architecture.md`](docs/architecture.md).
 
 ## Stack técnico (previsto)
 

@@ -18,12 +18,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
+from app.core.redis_client import redis_client
 from app.db.session import get_db
 from app.models.play import SongPlay
 from app.models.song import Song
 from app.models.user import User
 from app.schemas.song import SongRead, SongStreamURL
-from app.services import search, storage
+from app.services import popular, search, storage
 from app.services.transcode import (
     TranscodeError,
     probe_duration_seconds,
@@ -261,6 +262,33 @@ def search_songs_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="El buscador no está disponible en este momento",
         ) from exc
+
+
+@router.get("/popular", response_model=list[SongRead])
+def get_popular_songs(
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list[Song]:
+    """Registrado ANTES de /{song_id}, mismo motivo que /search: sin esto,
+    /songs/popular matchearía con song_id="popular" y fallaría con 422.
+
+    Sin personalización a propósito - "popular" es la misma lista para
+    cualquier usuario, a diferencia de GET /users/me/recommendations (Fase
+    11). El cálculo pesado ocurre a lo sumo una vez cada 5 min (cache-aside
+    en app/services/popular.py), no en cada request."""
+    song_ids = popular.get_popular_song_ids(db, redis_client, limit)
+    if not song_ids:
+        return []
+
+    songs = db.scalars(
+        select(Song).where(Song.id.in_(song_ids), Song.status == "ready")
+    ).all()
+    songs_by_id = {song.id: song for song in songs}
+    # Preserva el orden del caché (el ranking), no el orden natural de la
+    # consulta SQL - un id colgante o ya no "ready" se omite en vez de romper
+    # la respuesta (puede devolver menos de `limit` si eso ocurre).
+    return [songs_by_id[song_id] for song_id in song_ids if song_id in songs_by_id]
 
 
 @router.get("/{song_id}", response_model=SongRead)

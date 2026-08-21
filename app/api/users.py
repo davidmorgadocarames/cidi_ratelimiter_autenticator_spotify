@@ -1,4 +1,3 @@
-import redis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -10,7 +9,7 @@ from app.api.totp import (
     register_totp_failure,
     register_totp_success,
 )
-from app.core.config import settings
+from app.core.redis_client import redis_client
 from app.core.security import (
     TOTPDecryptionError,
     decrypt_totp_secret,
@@ -25,14 +24,6 @@ from app.schemas.user import PremiumActivateRequest, UserRead
 from app.services.recommendations import get_recommendations
 
 router = APIRouter(prefix="/users", tags=["users"])
-
-# Cliente Redis a nivel de módulo (mismo patrón que app/core/rate_limiter.py):
-# el proceso de FastAPI no hace fork, así que no aplica el footgun de
-# Celery+prefork que sí exige crear el cliente perezosamente dentro de la
-# tarea en app/worker.py.
-_redis_client: redis.Redis = redis.from_url(  # type: ignore[no-untyped-call]
-    settings.redis_url, decode_responses=True
-)
 
 
 @router.post("/me/premium/activate", response_model=UserRead)
@@ -111,7 +102,7 @@ def get_my_recommendations(
     primer ciclo) es un estado NORMAL y esperado, no una caída de servicio -
     a diferencia de la búsqueda en Meilisearch (Fase 10), que responde 503
     si el motor no está disponible: aquí se devuelve 200 con lista vacía."""
-    song_ids = get_recommendations(_redis_client, current_user.id)
+    song_ids = get_recommendations(redis_client, current_user.id)
     if not song_ids:
         return []
 

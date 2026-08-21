@@ -434,6 +434,45 @@ el stack dockerizado completo: `celery-worker`/`celery-beat` conectan al broker 
 (`redis://redis:6379/1`, confirmado en logs), un `celery -A app.worker call ...` manual dispara la tarea real
 y las recomendaciones aparecen en Redis y en el endpoint.
 
+**Fase 12 — Caché de contenido popular.** Nuevo endpoint `GET /songs/popular` (`app/api/songs.py`,
+registrado antes de `/{song_id}`, mismo motivo Starlette ya documentado para `/search`) y nuevo
+módulo `app/services/popular.py`: `fetch_popular_song_ids` (una query agregada,
+`song_plays` JOIN `songs` filtrando `status="ready"`, `GROUP BY song_id ORDER BY COUNT(*) DESC`) y
+`get_popular_song_ids` (cache-aside clásico contra una única clave global de Redis,
+`songs:popular`, TTL 5 min). **Técnica deliberadamente distinta a la Fase 11**: en vez de
+precalcular en background con Celery Beat, el ranking se calcula bajo demanda en el primer request
+que encuentra el caché vacío o expirado — dos patrones de caché/rendimiento diferentes en el mismo
+proyecto, no el mismo mecanismo repetido. Sin personalización (misma lista para todo el mundo, a
+diferencia de las recomendaciones) y sin lock anti-stampede (riesgo aceptado y documentado, la
+query es barata y el tráfico esperado de un portfolio no lo justifica).
+
+Pequeño refactor acompañante: `app/core/redis_client.py` (cliente Redis compartido a nivel de
+módulo) — `app/api/users.py` (Fase 11) ya instanciaba el suyo propio para leer recomendaciones;
+esta fase necesitaba el mismo cliente en `app/api/songs.py`, así que se extrajo a un módulo
+compartido en vez de duplicar la instanciación (y el `# type: ignore[no-untyped-call]` que la
+acompaña) una tercera vez. `decode_responses=True` se preservó explícitamente — `get_recommendations`
+ya asume `str`, no `bytes`, vía un `cast` que se habría roto silenciosamente de cambiar ese flag.
+
+**Detalle de diseño no trivial, encontrado en la revisión del plan**: el caché siempre se llena al
+tamaño máximo (100 IDs), nunca al `limit` pedido por la request que causó el miss, y el recorte al
+`limit` real ocurre en el lado de lectura — sin esto, una primera request con `limit=10` dejaría un
+caché corto que no podría servir una request posterior con `limit=50` hasta el siguiente TTL. La
+relectura de `Song` por IDs SÍ re-filtra `.where(Song.status == "ready")` (a diferencia del
+endpoint de recomendaciones de la Fase 11, que no re-filtra) — hallazgo de la revisión del plan,
+confirmado por dos revisores independientes: defensa en profundidad barata, sin coste real, aunque
+hoy no exista ninguna transición ready→otro-estado que la haga necesaria.
+
+11 tests nuevos en `tests/test_popular.py`: `fetch_popular_song_ids` contra Postgres real (ranking
+por conteo, exclusión de no-`"ready"`, respeta `limit`), `get_popular_song_ids` con una prueba real
+de cache-hit (se manipula la clave de Redis con un payload centinela que Postgres jamás produciría,
+y se confirma que la segunda llamada devuelve ESE payload, no un recálculo), expiración simulada
+borrando la clave directamente (sin `sleep` real), el detalle de "cachear al máximo" verificado con
+dos `limit` distintos sobre el mismo caché, y el endpoint completo (ranking, `limit`, `401`,
+exclusión de no-`"ready"`, dos usuarios distintos ven la misma lista, `limit` inválido → `422`).
+Verificado también manualmente contra el stack dockerizado: reproducir una canción, primera llamada
+a `/songs/popular` calcula y cachea (`TTL` confirmado en `redis-cli` = 300), segunda llamada
+devuelve lo mismo, y tras `DEL` manual de la clave, la siguiente llamada recalcula.
+
 ## Diagrama de arquitectura
 
 _Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
@@ -458,7 +497,7 @@ proyecto de portfolio).
 | 9    | Streaming de audio                        | ✅ Implementado |
 | 10   | Búsqueda                                  | ✅ Implementado |
 | 11   | Recomendaciones precalculadas (Celery)    | ✅ Implementado |
-| 12   | Caché de contenido popular                | ⬜ Pendiente    |
+| 12   | Caché de contenido popular                | ✅ Implementado |
 | 13   | Sincronización entre dispositivos         | ⬜ Pendiente    |
 | 14   | CD                                        | ⬜ Pendiente    |
 | 15   | Documentación final                       | ⬜ Pendiente    |
@@ -941,6 +980,41 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   con backoff indefinidamente en vez de salir, dando falso positivo), dispara la tarea real, y hace
   polling sobre Redis hasta ver aparecer una clave `recommendations:*`.
 
+**Fase 12 — Caché de contenido popular**
+
+- **Cache-aside con TTL bajo demanda, no Celery Beat**: decisión explícita del usuario para
+  demostrar una técnica de caché/rendimiento distinta de la ya usada en la Fase 11 (precómputo
+  programado en background) en vez de repetir el mismo mecanismo con otro nombre. Fase más pequeña
+  y autocontenida — no toca `app/worker.py` ni `docker-compose.yml`.
+- **Clave global única (`songs:popular`), sin personalización**: a diferencia de
+  `recommendations:{user_id}` de la Fase 11, "popular" es la misma lista para cualquier usuario —
+  sin excluir canciones ya reproducidas por quien pregunta, coherente con lo que significa un
+  ranking de tendencias real (los "top charts" de Spotify tampoco son por-usuario).
+- **Caché siempre al tamaño máximo, recorte en la lectura**: `get_popular_song_ids` guarda siempre
+  el top 100 en Redis, nunca el `limit` pedido por la request que causó el miss, y corta a `limit`
+  al leer — evita que una primera request con `limit` pequeño deje un caché corto que no pueda
+  servir una request posterior con `limit` mayor hasta el siguiente TTL.
+- **Sin lock anti-stampede** (decisión explícita, documentada, no un descuido): a diferencia del
+  lock construido para `recompute_all_recommendations` en la Fase 11, aquí no se replica el mismo
+  patrón — la query agregada es barata (misma clase ya medida en la Fase 11, ~0.03s), y el tráfico
+  esperado de un proyecto de portfolio no justifica el lock. Riesgo aceptado: varias requests
+  concurrentes justo al expirar el TTL podrían recalcular a la vez (mismo resultado, trabajo
+  duplicado, no incorrecto) — verificado en la revisión que `SET ... EX` resetea el TTL completo en
+  cada escritura, así que tampoco deja un TTL inconsistente más corto.
+- **Relectura de `Song` SÍ re-filtra `status="ready"`, a diferencia de las recomendaciones de la
+  Fase 11**: hallazgo de la revisión del plan (dos revisores independientes) — defensa en
+  profundidad barata, sin coste real, contra una canción que en el futuro pudiera dejar de ser
+  `"ready"` mientras sigue cacheada (hoy imposible, no existe esa transición, pero es una línea
+  gratis).
+- **Refactor del cliente Redis compartido (`app/core/redis_client.py`)**: evita una tercera
+  instanciación duplicada del mismo cliente (`app/api/users.py` ya tenía la suya desde la Fase 11).
+  `decode_responses=True` se preservó explícitamente al extraerlo — cambiarlo habría roto
+  silenciosamente el `cast("str | None", ...)` que ya asume `str` en `get_recommendations`.
+- **"Popular" es histórico completo, sin ventana temporal**: la query agrega TODO `song_plays`
+  desde el origen, sin filtro de fecha — una canción viral hace tiempo permanece arriba
+  indefinidamente aunque nadie la escuche ya, sin mecanismo de decaimiento (hallazgo de la revisión
+  del plan, ver también Riesgos conocidos).
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -1082,6 +1156,19 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   aceptado para `app`/Postgres/MinIO — sin alta disponibilidad, aceptado para el alcance de un
   proyecto de portfolio. El lock de Redis contra pases solapados no fue diseñado para coordinar
   múltiples workers, solo para evitar que el mismo worker acumule pases pendientes.
+- **"Popular" sin ventana temporal, deriva indefinidamente** (Fase 12): el ranking agrega TODO el
+  histórico de `song_plays` desde el origen, sin decaimiento por tiempo — una canción viral hace
+  mucho permanece arriba para siempre aunque nadie la escuche ya. Fuera de alcance ("popular por
+  periodo" no se implementó), aceptado.
+- **Sin protección anti-stampede en el caché de popular** (Fase 12): bajo concurrencia alta justo
+  al expirar el TTL, varias requests podrían recalcular el ranking a la vez (mismo resultado, solo
+  trabajo duplicado contra Postgres, no un resultado incorrecto). Riesgo aceptado, no se replicó el
+  lock atómico ya construido para el recompute de la Fase 11 — sobre-ingeniería para el tráfico
+  esperado de un portfolio.
+- **Hasta 5 min de retraso entre un play y que afecte el ranking de "popular"** (Fase 12): el TTL
+  del caché es la única fuente de refresco, sin invalidación activa al registrarse un nuevo play —
+  mismo tipo de retraso ya aceptado para las recomendaciones de la Fase 11 (ahí por el intervalo de
+  Beat, aquí por el TTL del caché).
 
 ## Cómo escalaría esto en producción real
 
