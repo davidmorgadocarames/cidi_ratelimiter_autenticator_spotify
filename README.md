@@ -267,7 +267,7 @@ Decisiones completas (por qué GHCR y no Docker Hub, por qué promover/rollback 
 operación, qué queda como diseño teórico sin servidor real) en
 [`docs/architecture.md`](docs/architecture.md).
 
-## Stack técnico (previsto)
+## Stack técnico
 
 - **Backend**: Python 3 + FastAPI
 - **Base de datos**: PostgreSQL (SQLAlchemy 2.0)

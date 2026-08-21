@@ -582,7 +582,56 @@ comportamiento desapareció al darle contenido real (ver Riesgos conocidos).
 
 ## Diagrama de arquitectura
 
-_Pendiente — diagrama completo (Mermaid o imagen) planificado para la Fase 15._
+```mermaid
+graph TB
+    subgraph Cliente["Cliente (browser / API client)"]
+        UI["app/static UI o curl/Postman"]
+    end
+
+    subgraph Compose["docker-compose (entorno local)"]
+        API["FastAPI (app)<br/>rate limiter - auth/2FA - songs - users - playback"]
+        PG[(PostgreSQL)]
+        REDIS[(Redis)]
+        MINIO[(MinIO<br/>audio objects)]
+        MEILI[(Meilisearch)]
+        CBEAT["celery-beat<br/>(scheduler, cada 5 min)"]
+        CWORKER["celery-worker<br/>(recomendaciones)"]
+    end
+
+    subgraph CICD["CI/CD (GitHub Actions)"]
+        CI["ci.yml<br/>test + build/smoke"]
+        CD["cd.yml<br/>build-and-push / set-production-tag"]
+        GHCR[("GHCR<br/>tags: sha-*, staging, production")]
+    end
+
+    subgraph Futuro["Fuera de alcance - diseno teorico (ver 'Como escalaria esto')"]
+        SRV["VPS unico<br/>(Watchtower / webhook)"]
+    end
+
+    UI -- "HTTP + Bearer JWT" --> API
+    API -- "SQLAlchemy" --> PG
+    API -- "rate limit, cache popular,<br/>recomendaciones, playback state" --> REDIS
+    API -- "genera presigned URL<br/>(control plane)" --> MINIO
+    UI -- "descarga bytes directo,<br/>Range Requests (data plane)" --> MINIO
+    API -- "index / search" --> MEILI
+    CBEAT -- "dispara tarea<br/>(lock en Redis)" --> CWORKER
+    CWORKER -- "lee song_plays, songs" --> PG
+    CWORKER -- "escribe recommendations" --> REDIS
+    CWORKER -. "broker" .-> REDIS
+
+    CI -- "push a main, CI verde<br/>(workflow_run)" --> CD
+    CD -- "build-and-push<br/>(automatico)" --> GHCR
+    CD -- "set-production-tag<br/>(workflow_dispatch manual)" --> GHCR
+    GHCR -. "pull (no implementado)" .-> SRV
+```
+
+Distinción clave visible en el diagrama: la API nunca reenvía bytes de audio — genera una URL
+presignada de MinIO (`control plane`) y el cliente descarga directamente de MinIO (`data plane`),
+decisión central de la Fase 9. `celery-worker` lee `song_plays`/`songs` de Postgres pero escribe el
+resultado (`recommendations:{user_id}`) en Redis, no en Postgres — no existe un modelo
+`Recommendation`, la API sirve `GET /users/me/recommendations` leyendo esa misma key. El nodo "VPS
+único" está fuera del sistema implementado — representa el diseño teórico de la siguiente sección,
+no una réplica desplegada.
 
 ## Fases implementadas vs diseño teórico
 
@@ -607,7 +656,7 @@ proyecto de portfolio).
 | 12   | Caché de contenido popular                | ✅ Implementado |
 | 13   | Sincronización entre dispositivos         | ✅ Implementado |
 | 14   | CD                                        | ✅ Implementado |
-| 15   | Documentación final                       | ⬜ Pendiente    |
+| 15   | Documentación final                       | ✅ Implementado |
 
 ## Decisiones técnicas
 
@@ -1400,8 +1449,58 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 
 ## Cómo escalaría esto en producción real
 
-_Pendiente — sección dedicada en la Fase 15 (CDN, réplicas geográficas, Cassandra para estado de
-reproducción, etc.), con notas parciales añadidas en las fases que las motivan (9, 12, 13, 14)._
+Esta sección consolida notas parciales ya dejadas en fases anteriores (9, 12, 13, 14) sobre qué
+cambiaría si este proyecto sirviera tráfico real, en vez de duplicar el razonamiento — cada punto
+enlaza a la fase que lo motivó y a su entrada correspondiente en Riesgos conocidos.
+
+**Balanceo de carga y réplicas de la API (Fases 6, 7)**: el rate limiter ya está diseñado desde la
+Fase 6 para múltiples réplicas (estado compartido en Redis, no en memoria local), pero hoy corre un
+único contenedor `app` (Fase 7) — el diseño multi-réplica sigue siendo teórico hasta que exista un
+balanceador delante. En producción real: N réplicas del contenedor `app` detrás de un balanceador
+(nginx, un ALB, Traefik), todas compartiendo el mismo Redis/Postgres. Dos cambios necesarios que hoy
+no están resueltos: (a) mover `alembic upgrade head` del `ENTRYPOINT` a un job/init-container
+separado que corra una sola vez antes de que las réplicas arranquen — Alembic no tiene locking
+distribuido, así que N réplicas ejecutando la migración a la vez es una condición de carrera (riesgo
+aceptado de la Fase 7, ver "Migraciones automáticas del `ENTRYPOINT` no soportan réplicas
+concurrentes" en Riesgos conocidos); (b) el rate limiter dejaría de poder usar `request.client.host`
+de forma fiable — un balanceador/proxy delante rompe esa asunción, haría falta leer
+`X-Forwarded-For` (o el header equivalente del balanceador elegido) de forma explícita y validada,
+en vez del fallback a IP de conexión TCP directa que usa hoy (asunción explícita de la Fase 6, ver
+Decisiones técnicas de esa fase).
+
+**CDN y distribución de audio (Fase 9)**: hoy el cliente descarga el audio directo de MinIO vía URL
+presignada (data plane) tras pedir la URL a la API (control plane) — patrón que ya evita que la API
+reenvíe bytes de audio, pero MinIO sigue siendo un único nodo sin distribución geográfica. En
+producción real: un CDN (CloudFront, Cloudflare) delante del bucket, con la API generando URLs
+firmadas que el CDN valida y cachea en el edge — reduce latencia para usuarios lejos de la región
+del bucket y quita carga de ancho de banda a MinIO/S3 directamente. Dos gaps ya documentados en la
+Fase 9 que un despliegue real tendría que cerrar primero (ver Riesgos conocidos, entrada
+`s3_public_endpoint_url`): HTTPS de extremo a extremo (hoy se asume que cliente y servidor comparten
+host — un CDN con TLS resolvería el mixed-content, pero exige que el origin también hable HTTPS) y
+una política CORS en el bucket (hoy no configurada, necesaria en cuanto el frontend consuma el audio
+vía `fetch()`/MediaSource en vez de un `<audio src>` plano).
+
+**Estado de reproducción a gran escala (Fase 13)**: `PUT /users/me/playback` guarda el estado en una
+key de Redis con TTL de 24h — funciona bien para el volumen de un portfolio, pero un reproductor
+real reportando posición cada ~5s por dispositivo activo generaría un write por heartbeat por
+dispositivo por usuario activo (límite de escala ya documentado en la Fase 13, sin resolver). Redis
+sigue siendo razonable como *caché* de "último estado conocido" para lecturas rápidas, pero un
+volumen de escritura tan alto y sostenido es exactamente el caso de uso para el que existe Cassandra
+(u otra base de columnas anchas, ScyllaDB): escrituras masivas, sin necesidad de transacciones,
+particionadas naturalmente por `user_id`+`device_id`, con TTL nativo por columna equivalente al TTL
+de Redis de hoy. El cambio no sería trivial — sustituye un almacén clave-valor único por un modelo de
+particionado explícito — pero es la pieza de este proyecto donde el patrón de acceso actual (muchas
+escrituras pequeñas, idempotentes, con expiración) más se aleja de lo que Redis en un único nodo
+puede sostener indefinidamente.
+
+**Contenido popular a escala (Fase 12)**: el ranking de `GET /songs/popular` agrega hoy todo el
+histórico de `song_plays` sin ventana temporal (deriva indefinidamente, ver Riesgos conocidos de esa
+fase) y no tiene protección anti-stampede (aceptado, tráfico de portfolio). A escala real: (a) una
+ventana temporal (ej. "popular últimos 7 días") requeriría indexar `song_plays.played_at`, cambiando
+la agregación de "todo el histórico" a un rango — hoy fuera de alcance porque no se implementó
+"popular por periodo"; (b) el recálculo periódico ya construido para recomendaciones (Fase 11, con
+su lock atómico en Redis) es el mismo patrón que resolvería el anti-stampede aquí, si el tráfico lo
+justificara — no se replicó en la Fase 12 por ser sobre-ingeniería para el volumen esperado.
 
 **Despliegue real (Fase 14, diseño teórico, no implementado)**: sin servidor real disponible, lo
 que un pipeline de CD completo haría después de que `cd.yml` mueva el tag `production` en GHCR es
