@@ -27,6 +27,10 @@ dist/
 uploads/
 media/
 
+# Dataset de Kaggle para app/cli/seed_catalog.py - se descarga a mano (Kaggle
+# exige login), nunca se comitea (decisión explícita, ver docs/architecture.md).
+dataset.csv
+
 # Editores / SO
 .vscode/
 .idea/

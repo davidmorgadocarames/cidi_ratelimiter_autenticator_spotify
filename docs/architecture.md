@@ -1252,6 +1252,94 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   especial, a diferencia de la API de repos/Actions/PRs ya usada sin token en fases anteriores;
   `imagetools inspect` sí funciona anónimo contra el registry.
 
+## Seed de catálogo desde Kaggle
+
+Herramienta de desarrollo (no forma parte de la app en producción, nunca se registra en
+`app/main.py`) para poblar el catálogo con título/artista reales de un dataset de Kaggle
+sin infringir copyright de audio: el audio real nunca se descarga - se genera UN tono
+sintético con `ffmpeg` (mismo patrón que `tests/conftest.py::sample_audio_file`), se sube
+una única vez a MinIO bajo una key fija, y todas las filas `Song` sembradas apuntan a esa
+misma key compartida.
+
+Dataset usado:
+[maharshipandya/spotify-tracks-dataset](https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset)
+(~114k filas, columnas `track_name`/`artists`). Se descarga a mano (Kaggle exige login) -
+**nunca se comitea al repo** (`.gitignore`), se referencia por ruta.
+
+Dos scripts en `app/cli/` (no en un `scripts/` top-level): así se copian solos con el
+`COPY app/ ./app` que el `Dockerfile` ya tiene, sin tocarlo, y ya caen en el alcance
+actual de `mypy`/`ruff` (`mypy app tests`). Ninguno de los dos importa código de
+producción ni se importa desde él.
+
+- `app/cli/catalog_server.py`: mini servidor FastAPI que carga el CSV en memoria y
+  expone `GET /tracks?offset=&limit=` - "simula" que el catálogo viene de un servidor
+  real (HTTP de verdad, no solo una función con nombre engañoso). Escucha en
+  `127.0.0.1` (no `0.0.0.0`): el compose no declara una red propia, así que
+  `celery-worker`/`celery-beat` podrían alcanzarlo por DNS de servicio si escuchara en
+  todas las interfaces.
+- `app/cli/seed_catalog.py`: pagina contra ese servidor por HTTP real, exige un usuario
+  YA registrado (`--user-email`, nunca inventa uno - la FK `uploaded_by_id` de `Song` es
+  obligatoria), trunca título/artista a 255 caracteres (límite de la columna), hace
+  dedup por `(title, artist)` ya truncados (sin `UNIQUE` en la BD que lo respalde -
+  riesgo de carrera aceptado para una herramienta manual que se corre una vez, no
+  concurrentemente), y reutiliza `app.services.storage.upload_file` y
+  `app.services.search.index_song` tal cual.
+
+**`ffmpeg` no está en el host de desarrollo (Windows), solo dentro del contenedor
+"app"** (verificado empíricamente) - por eso los dos procesos corren DENTRO del mismo
+contenedor, no en el host.
+
+Flujo operativo completo (ad-hoc, no automatizado en `docker-compose.yml` - sembrar
+datos de desarrollo no es un servicio permanente):
+
+```bash
+# 1. Copiar el CSV descargado al contenedor (docker cp es un paso ad-hoc, no un bind
+#    mount permanente - no toca docker-compose.yml).
+docker cp dataset.csv <container>:/tmp/dataset.csv
+
+# 2. Arrancar el catalog_server en segundo plano dentro del contenedor.
+docker compose exec -d app python -m app.cli.catalog_server --csv /tmp/dataset.csv --port 8899
+
+# 3. Sembrar (--limit tope duro de 1000 - por encima, correr varias tandas: cada fila
+#    hace un commit + una llamada síncrona a Meilisearch, wait_for_task con timeout
+#    10s, así que un --limit grande es lento sin dar ninguna señal de progreso salvo
+#    la línea "... N/total" cada 10 filas).
+docker compose exec app python -m app.cli.seed_catalog --user-email dev@example.com --limit 50
+
+# 4. Parar el catalog_server - IMPORTANTE, si no queda en background indefinidamente y
+#    un segundo intento falla con "address already in use" en el puerto 8899.
+#    La imagen (python:3.12-slim-bookworm) NO trae el paquete procps - `pkill`/`ps` no
+#    existen dentro del contenedor (verificado empíricamente: "exec: pkill: no such
+#    file") y no se añade solo para esto (tocaría el Dockerfile → rama+PR). El
+#    sustituto verificado es este one-liner de Python que escanea /proc:
+docker compose exec app python -c "
+import os, signal
+me = os.getpid()
+for pid in os.listdir('/proc'):
+    if not pid.isdigit() or int(pid) == me:
+        continue
+    try:
+        with open(f'/proc/{pid}/cmdline', 'rb') as f:
+            cmdline = f.read().decode(errors='replace')
+    except OSError:
+        continue
+    if 'app.cli.catalog_server' in cmdline and 'python -c' not in cmdline:
+        os.kill(int(pid), signal.SIGTERM)
+"
+```
+
+El resumen final de `seed_catalog` (`"Creadas: N, omitidas (ya existían): M, sin
+indexar en el buscador: K"`) distingue explícitamente las filas creadas en Postgres de
+las que además quedaron buscables en Meilisearch - `search.index_song` sigue siendo
+best-effort (nunca bloquea la creación de la fila), pero sin este contador un
+Meilisearch caído a mitad de una tirada grande pasaría desapercibido tras un "Creadas:
+N" que parece éxito total.
+
+Verificado empíricamente de extremo a extremo contra el dataset real (columnas
+`track_name`/`artists` confirmadas, seed real, idempotencia en un segundo run, parada y
+reinicio del `catalog_server` sin conflicto de puerto, reproducción funcionando vía
+`GET /songs/{id}/stream`).
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el

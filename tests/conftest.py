@@ -170,6 +170,17 @@ def meilisearch_client() -> MeilisearchClient:
 
 
 @pytest.fixture()
+def test_session_factory() -> sessionmaker[Session]:
+    """La fábrica de sesiones de test, para monkeypatchear módulos que abren
+    su propia Session fuera del ciclo de vida de FastAPI (ej.
+    app/cli/seed_catalog.py, que usa app.db.session.SessionLocal directamente
+    porque es un script, no un endpoint) - mismo motivo que
+    app.dependency_overrides[get_db] arriba, pero para código que no pasa por
+    Depends(get_db)."""
+    return TestSessionLocal
+
+
+@pytest.fixture()
 def sample_audio_file() -> Iterator[Path]:
     """Genera un archivo de audio real y minúsculo con ffmpeg (un tono de 1s)
     - nada de fixtures binarias commiteadas al repo."""

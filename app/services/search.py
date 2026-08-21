@@ -42,11 +42,17 @@ def ensure_index_exists() -> None:
     _client.wait_for_task(task_info.task_uid, timeout_in_ms=_TASK_TIMEOUT_MS)
 
 
-def index_song(song: Song) -> None:
+def index_song(song: Song) -> bool:
     """Best-effort, nunca propaga: si falla indexar, se loguea y no pasa
     nada más - la subida (POST /songs) ya respondió 201 con la canción
     reproducible, la búsqueda es una capa derivada, no el núcleo de la
     funcionalidad (ver docs/architecture.md, Fase 10).
+
+    Devuelve True/False según si la indexación tuvo éxito - upload_song (Fase
+    10) sigue ignorando el valor de retorno a propósito (no debe depender de
+    él), pero app/cli/seed_catalog.py sí lo usa para reportar cuántas
+    canciones sembradas no quedaron buscables, en vez de mentir con un
+    "Creadas: N" que no distingue si además se indexaron.
 
     Defensa en profundidad: no confía ciegamente en que el llamador solo la
     invoque para canciones status="ready" - lo comprueba aquí también."""
@@ -57,7 +63,7 @@ def index_song(song: Song) -> None:
             song.id,
             song.status,
         )
-        return
+        return False
 
     document = {
         "id": song.id,
@@ -84,6 +90,9 @@ def index_song(song: Song) -> None:
             raise RuntimeError(f"Meilisearch task {task.status}: {task.error}")
     except Exception:
         logger.exception("No se pudo indexar la canción %s en Meilisearch", song.id)
+        return False
+
+    return True
 
 
 def search_songs(query: str, limit: int, offset: int) -> list[dict[str, Any]]:
