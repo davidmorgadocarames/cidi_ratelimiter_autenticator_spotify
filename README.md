@@ -6,7 +6,8 @@ Repositorio: https://github.com/davidmorgadocarames/cidi_ratelimiter_autenticato
 
 Proyecto de portfolio que combina, sobre una API tipo Spotify con datos reales:
 
-- **CI/CD real** con GitHub Actions (tests, lint, type-check, despliegue a staging/producción).
+- **CI/CD real** con GitHub Actions (tests, lint, type-check, publicación versionada de la imagen
+  en GitHub Container Registry con tags staging/producción y rollback real).
 - **Rate limiting con Redis** usando el algoritmo *token bucket*.
 - **Autenticación de dos factores (TOTP, RFC 6238)** para proteger acciones sensibles.
 - **API de streaming de audio**: subida y transcodificación, streaming con Range Requests,
@@ -19,7 +20,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-13 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-14 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -31,8 +32,9 @@ postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` 
 catálogo público de canciones, streaming real con Range Requests vía URLs firmadas de MinIO
 (control plane/data plane), búsqueda de canciones por título/artista con Meilisearch, y
 recomendaciones precalculadas por afinidad de artista con Celery, un ranking global de contenido
-popular cacheado en Redis (cache-aside con TTL), y sincronización del estado de reproducción entre
-dispositivos (REST last-write-wins). Ver el roadmap completo abajo y el detalle de qué
+popular cacheado en Redis (cache-aside con TTL), sincronización del estado de reproducción entre
+dispositivos (REST last-write-wins), y CD real publicando la imagen versionada en GitHub Container
+Registry (sin servidor real, ver esa sección). Ver el roadmap completo abajo y el detalle de qué
 está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
@@ -225,6 +227,42 @@ inexistente), a diferencia del `200`+lista vacía de `GET /users/me/recommendati
 /songs/popular` (esos SÍ son listas, donde vacío es un estado válido). Decisiones completas y
 riesgos aceptados (reintentos de red, "parpadeo" entre pestañas del mismo usuario, presupuesto de
 rate limit compartido) en [`docs/architecture.md`](docs/architecture.md).
+
+## CD (Fase 14)
+
+**Sin servidor/VPS/cuenta de nube real** (decisión explícita, proyecto de portfolio sin
+presupuesto de infraestructura) — "staging" y "producción" se modelan como **dos tags de la misma
+imagen Docker** en [GitHub Container Registry](https://ghcr.io) (gratis, usa el `GITHUB_TOKEN` ya
+disponible, sin cuentas ni credenciales nuevas), no como dos entornos reales:
+
+- `ghcr.io/<owner>/<repo>:staging` se actualiza automáticamente en cada push a `main` que pasa CI
+  en verde (`.github/workflows/cd.yml`, disparado tras `ci.yml` vía `workflow_run`).
+- `ghcr.io/<owner>/<repo>:sha-<7 chars>` — cada build queda también taggeado por su commit exacto,
+  el identificador real para promover/revertir.
+- `ghcr.io/<owner>/<repo>:production` solo se mueve con una acción manual
+  (`workflow_dispatch` → input `target_sha`) — **promover a producción y hacer rollback son la
+  misma operación**: apuntar `production` a un SHA ya publicado, más nuevo (promover) o más viejo
+  (rollback) que el actual.
+
+```bash
+# Desde la pestaña Actions → CD → Run workflow, con target_sha = los 7
+# caracteres del commit a promover o al que revertir.
+```
+
+**Pasos manuales/prerrequisitos, una sola vez**:
+1. **Workflow permissions del repo** — Settings → Actions → General → Workflow permissions debe
+   permitir "Read and write permissions" (o al menos que `GITHUB_TOKEN` pueda escribir en
+   Packages); si el repo tuviera fijado "Read-only" sin "Allow GitHub Actions to create...", el
+   primer `docker push` a GHCR fallaría en el login/push. Configuración por defecto de GitHub para
+   repos nuevos, normalmente ya correcta sin tocar nada.
+2. **Visibilidad del paquete** — un paquete publicado vía `GITHUB_TOKEN` nace privado en GHCR
+   incluso en un repo público — hay que hacerlo público a mano una vez (Settings del paquete →
+   Change visibility → Public) para poder verificarlo sin token (`docker buildx imagetools inspect
+   ghcr.io/<owner>/<repo>:<tag>`, pull anónimo contra el registry).
+
+Decisiones completas (por qué GHCR y no Docker Hub, por qué promover/rollback son la misma
+operación, qué queda como diseño teórico sin servidor real) en
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Stack técnico (previsto)
 
