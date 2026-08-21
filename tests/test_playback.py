@@ -25,6 +25,16 @@ def _headers(access_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token}"}
 
 
+def _parse_iso(value: str) -> datetime:
+    """Pydantic v2 serializa datetimes UTC con sufijo "Z" (visto en
+    verificación manual: "...T07:00:18.699465Z"), pero
+    datetime.fromisoformat() solo soporta "Z" desde Python 3.11 - la matriz
+    de CI de este proyecto incluye 3.10 (ver .github/workflows/ci.yml), así
+    que hay que normalizar "Z" a "+00:00" a mano para que los tests corran
+    en las tres versiones."""
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def _create_song_directly(
     db_session: Session,
     uploaded_by_id: int,
@@ -103,7 +113,7 @@ def test_put_playback_success_returns_state_with_server_timestamp(
     # el nombre del test prometía verificar el sellado del servidor, pero la
     # única aserción previa no distinguía eso de cualquier valor arbitrario) -
     # parsea el ISO y confirma que es un timestamp reciente de verdad.
-    updated_at = datetime.fromisoformat(body["updated_at"])
+    updated_at = _parse_iso(body["updated_at"])
     assert datetime.now(timezone.utc) - updated_at < timedelta(seconds=5)
 
 
@@ -133,7 +143,7 @@ def test_put_playback_ignores_client_supplied_updated_at(
     )
 
     assert response.status_code == 200
-    updated_at = datetime.fromisoformat(response.json()["updated_at"])
+    updated_at = _parse_iso(response.json()["updated_at"])
     assert datetime.now(timezone.utc) - updated_at < timedelta(seconds=5)
 
 
