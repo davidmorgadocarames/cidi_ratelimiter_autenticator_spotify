@@ -19,7 +19,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-12 completadas** — scaffolding del proyecto, API base con autenticación JWT
+🚧 **Fases 0-13 completadas** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -30,8 +30,9 @@ completamente dockerizada (imagen multi-stage, no-root, healthchecks cruzados co
 postgres/redis, smoke test en CI), subida/transcodificación de audio (`ffmpeg` + MinIO) con un
 catálogo público de canciones, streaming real con Range Requests vía URLs firmadas de MinIO
 (control plane/data plane), búsqueda de canciones por título/artista con Meilisearch, y
-recomendaciones precalculadas por afinidad de artista con Celery, y un ranking global de contenido
-popular cacheado en Redis (cache-aside con TTL). Ver el roadmap completo abajo y el detalle de qué
+recomendaciones precalculadas por afinidad de artista con Celery, un ranking global de contenido
+popular cacheado en Redis (cache-aside con TTL), y sincronización del estado de reproducción entre
+dispositivos (REST last-write-wins). Ver el roadmap completo abajo y el detalle de qué
 está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
@@ -208,6 +209,22 @@ guarda en Redis, y las requests siguientes leen directo del caché hasta que exp
 cache-stampede (riesgo aceptado y documentado: bajo concurrencia justo al expirar, varias requests
 podrían recalcular a la vez — mismo resultado, solo trabajo duplicado, no incorrecto). Decisiones
 completas en [`docs/architecture.md`](docs/architecture.md).
+
+## Sincronización entre dispositivos (Fase 13)
+
+`PUT /users/me/playback` reporta el estado de reproducción de un dispositivo (`song_id`,
+`position_seconds`, `is_playing`, `device_id`); `GET /users/me/playback` devuelve el último estado
+conocido, sin importar qué dispositivo lo reportó. Sincronización vía **REST simple,
+last-write-wins**, no WebSockets — proyecto backend-focused sin UI de reproducción real (Fase 9)
+que consumiera push en tiempo real de todas formas. `updated_at` lo sella siempre el servidor,
+nunca el cliente. **Alcance honesto**: es un único puntero global "reproduciendo ahora" por
+usuario, compartido entre todos sus dispositivos — `device_id` es metadata de quién escribió por
+última vez, no habilita un estado independiente por dispositivo (eso sería un sistema de gestión de
+dispositivos, fuera de alcance). `GET` sin ningún estado reportado responde `404` (recurso singular
+inexistente), a diferencia del `200`+lista vacía de `GET /users/me/recommendations`/`GET
+/songs/popular` (esos SÍ son listas, donde vacío es un estado válido). Decisiones completas y
+riesgos aceptados (reintentos de red, "parpadeo" entre pestañas del mismo usuario, presupuesto de
+rate limit compartido) en [`docs/architecture.md`](docs/architecture.md).
 
 ## Stack técnico (previsto)
 

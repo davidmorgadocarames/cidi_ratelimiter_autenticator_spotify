@@ -462,16 +462,65 @@ endpoint de recomendaciones de la Fase 11, que no re-filtra) — hallazgo de la 
 confirmado por dos revisores independientes: defensa en profundidad barata, sin coste real, aunque
 hoy no exista ninguna transición ready→otro-estado que la haga necesaria.
 
-11 tests nuevos en `tests/test_popular.py`: `fetch_popular_song_ids` contra Postgres real (ranking
-por conteo, exclusión de no-`"ready"`, respeta `limit`), `get_popular_song_ids` con una prueba real
-de cache-hit (se manipula la clave de Redis con un payload centinela que Postgres jamás produciría,
-y se confirma que la segunda llamada devuelve ESE payload, no un recálculo), expiración simulada
-borrando la clave directamente (sin `sleep` real), el detalle de "cachear al máximo" verificado con
-dos `limit` distintos sobre el mismo caché, y el endpoint completo (ranking, `limit`, `401`,
-exclusión de no-`"ready"`, dos usuarios distintos ven la misma lista, `limit` inválido → `422`).
-Verificado también manualmente contra el stack dockerizado: reproducir una canción, primera llamada
-a `/songs/popular` calcula y cachea (`TTL` confirmado en `redis-cli` = 300), segunda llamada
-devuelve lo mismo, y tras `DEL` manual de la clave, la siguiente llamada recalcula.
+13 tests en `tests/test_popular.py` (11 en la implementación inicial + 2 añadidos en la revisión
+post-implementación): `fetch_popular_song_ids` contra Postgres real (ranking por conteo, exclusión
+de no-`"ready"`, respeta `limit`), `get_popular_song_ids` con una prueba real de cache-hit (se
+manipula la clave de Redis con un payload centinela que Postgres jamás produciría, y se confirma
+que la segunda llamada devuelve ESE payload, no un recálculo), expiración simulada borrando la
+clave directamente (sin `sleep` real), el detalle de "cachear al máximo" verificado con dos `limit`
+distintos sobre el mismo caché, el endpoint completo (ranking, `limit`, `401`, exclusión de
+no-`"ready"`, dos usuarios distintos ven la misma lista, `limit` inválido → `422`), degradación con
+gracia si Redis falla (hallazgo de la revisión: `get_popular_song_ids` cae a calcular directo
+contra Postgres en vez de propagar el error), y un test que envenena el caché con un ID
+colgante/no-`"ready"` golpeando el ENDPOINT directamente (hallazgo de la revisión: el filtro
+defensivo de la relectura nunca se ejercitaba porque `fetch_popular_song_ids` ya filtra `"ready"`
+al escribir). Verificado también manualmente contra el stack dockerizado: reproducir una canción,
+primera llamada a `/songs/popular` calcula y cachea (`TTL` confirmado en `redis-cli` = 300),
+segunda llamada devuelve lo mismo, y tras `DEL` manual de la clave, la siguiente llamada recalcula.
+
+**Fase 13 — Sincronización entre dispositivos.** Nuevo router `app/api/playback.py`
+(`prefix="/users"`, URL final `/users/me/playback`, archivo separado por dominio de recurso propio
+aunque comparta prefijo con `app/api/users.py`), nuevo schema `app/schemas/playback.py`
+(`PlaybackStateUpdate`/`PlaybackState`) y nuevo servicio `app/services/playback.py`
+(`set_playback_state`/`get_playback_state`, clave `playback:{user_id}` en Redis, TTL 24h).
+**Decisión explícita del usuario**: REST simple (`PUT`/`GET`), last-write-wins, sin WebSockets ni
+infraestructura de tiempo real — proyecto backend-focused sin UI de reproducción real (Fase 9) que
+consumiera push en vivo de todas formas.
+
+`PUT /users/me/playback` valida que `song_id` exista (`404`) y esté `status="ready"` (`409` — mismo
+patrón exacto que `get_song_stream_url` de la Fase 9), sella `updated_at` con la hora del SERVIDOR
+(nunca la del cliente, mismo principio ya aplicado a `created_at`/`played_at`), y guarda el estado.
+`GET /users/me/playback` devuelve `404` si nunca se reportó nada — **deliberadamente distinto** de
+`GET /users/me/recommendations` (Fase 11) o `GET /songs/popular` (Fase 12), que devuelven
+`200`+lista vacía: aquí el recurso es un objeto singular, no una lista, así que "nada reportado
+todavía" se modela como recurso inexistente, no como un objeto vacío artificial.
+
+**Bug real encontrado en la revisión del plan, antes de escribir código**: el diseño original
+construía el estado con `updated_at` como objeto `datetime` y lo pasaba directo a
+`json.dumps` dentro de `set_playback_state` — `json.dumps` no serializa `datetime` por defecto,
+así que cada `PUT` habría respondido `500`. Corregido serializando con
+`PlaybackState(...).model_dump(mode="json")` en el endpoint antes de pasar el dict a
+`set_playback_state` — Pydantic sí sabe volcar `datetime` a ISO 8601 en modo JSON.
+
+**Honestidad de alcance, también encontrada en la revisión del plan**: `device_id` se guarda y se
+devuelve, pero nunca es parte de la clave de Redis y nunca se consulta por separado — es metadata
+de "quién escribió el estado por última vez", no un sistema de tracking per-dispositivo. El diseño
+entrega un **único puntero global "reproduciendo ahora" por usuario**, compartido entre todos sus
+dispositivos (todos convergen a ver lo mismo), no un estado independiente por cada uno. También de
+esa revisión: la causa real de un "last write" incorrecto no es tanto que dos dispositivos
+compitan en la red (el servidor sella `updated_at` al RECIBIR, así que el orden de llegada ya ES el
+"last write" por definición) — el escenario real es un **reintento automático o request duplicada
+del MISMO cliente**, que reenvía un cuerpo con posición ya vieja y sobreescribe con datos obsoletos
+un estado más fresco de otro dispositivo.
+
+13 tests en `tests/test_playback.py`: round-trip del servicio contra Redis real, `PUT` (éxito con
+`updated_at` del servidor, `404`/`409` según estado de la canción, `422` en `position_seconds`
+negativo/`device_id` vacío, `401`), `GET` (`404` sin estado previo, `200` con el último tras un
+`PUT`, `401`), el **escenario central de la fase** (dos "dispositivos" hacen `PUT` en secuencia, el
+segundo sobreescribe al primero, `GET` devuelve el del segundo — last-write-wins real de punta a
+punta vía HTTP), y aislamiento entre usuarios (propiedad opuesta a la de `GET /songs/popular`: cada
+uno ve solo lo suyo). Verificado también manualmente contra el stack dockerizado: dos `curl`
+simulando dispositivos distintos, `GET` final confirma el estado del segundo.
 
 ## Diagrama de arquitectura
 
@@ -498,7 +547,7 @@ proyecto de portfolio).
 | 10   | Búsqueda                                  | ✅ Implementado |
 | 11   | Recomendaciones precalculadas (Celery)    | ✅ Implementado |
 | 12   | Caché de contenido popular                | ✅ Implementado |
-| 13   | Sincronización entre dispositivos         | ⬜ Pendiente    |
+| 13   | Sincronización entre dispositivos         | ✅ Implementado |
 | 14   | CD                                        | ⬜ Pendiente    |
 | 15   | Documentación final                       | ⬜ Pendiente    |
 
@@ -1015,6 +1064,36 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   indefinidamente aunque nadie la escuche ya, sin mecanismo de decaimiento (hallazgo de la revisión
   del plan, ver también Riesgos conocidos).
 
+**Fase 13 — Sincronización entre dispositivos**
+
+- **REST simple, last-write-wins, sin WebSockets**: decisión explícita del usuario — proyecto
+  backend-focused sin UI de reproducción real (Fase 9) que consumiera push en tiempo real de todas
+  formas. Añadir WebSockets habría sido la primera infraestructura realtime del proyecto,
+  desproporcionado para el alcance de esta fase.
+- **`404` en `GET` sin estado, no `200`+objeto vacío**: deliberadamente distinto de `GET
+  /users/me/recommendations` (Fase 11) / `GET /songs/popular` (Fase 12), que sí devuelven
+  `200`+lista vacía — ahí el recurso es una lista (vacía es un estado válido), aquí es un objeto
+  singular (inexistente se modela como `404`, semántica REST estándar).
+- **`updated_at` lo sella el servidor, nunca el cliente**: mismo principio de no confiar en relojes
+  de cliente ya aplicado a `created_at` de `Song` y `played_at` de `SongPlay` (ambos
+  `server_default=func.now()`).
+- **Bug real encontrado en la revisión del plan, corregido antes de escribir código**: el diseño
+  original pasaba `updated_at` como objeto `datetime` directo a `json.dumps` — `json.dumps` no
+  serializa `datetime` por defecto, cada `PUT` habría respondido `500`. Corregido serializando vía
+  `PlaybackState(...).model_dump(mode="json")` antes de guardar en Redis.
+- **`device_id` es metadata, no un sistema de tracking per-dispositivo**: nunca es parte de la
+  clave de Redis, nunca se consulta por separado. El diseño entrega un único puntero global
+  "reproduciendo ahora" por usuario, compartido entre todos sus dispositivos — honestidad de
+  alcance explícita (hallazgo de la revisión del plan), para que el campo no sugiera más
+  consciencia de dispositivo de la que realmente hay.
+- **Last-write-wins: el escenario real de riesgo es distinto del que parecía obvio** (hallazgo de
+  la revisión del plan): como el servidor sella `updated_at` al RECIBIR la request, el orden de
+  llegada YA ES el "last write" por definición — dos dispositivos compitiendo en red normal casi
+  nunca produce una inversión observable. El escenario real es un reintento automático o request
+  duplicada del MISMO cliente, que reenvía un cuerpo con posición vieja y sobreescribe con datos
+  obsoletos un estado más fresco de otro dispositivo. Sin número de secuencia ni idempotency key
+  para detectarlo — aceptado.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -1169,6 +1248,25 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   del caché es la única fuente de refresco, sin invalidación activa al registrarse un nuevo play —
   mismo tipo de retraso ya aceptado para las recomendaciones de la Fase 11 (ahí por el intervalo de
   Beat, aquí por el TTL del caché).
+- **Sin resolución de reintentos/requests duplicadas** (Fase 13): un reintento automático del mismo
+  cliente con un cuerpo ya viejo puede sobreescribir un estado más fresco de otro dispositivo — sin
+  número de secuencia ni idempotency key para detectarlo. Aceptado para el alcance de un portfolio.
+- **"Parpadeo" (flickering) entre dispositivos legítimos** (Fase 13): dos pestañas del mismo
+  usuario reproduciendo la MISMA canción y reportando posición cada pocos segundos se pisan
+  constantemente entre sí sobre la única clave compartida, aunque ambas sean reproducciones
+  legítimas — inherente al diseño de "un solo puntero global por usuario", sin mecanismo para
+  evitarlo.
+- **Validación de `song_id` contra Postgres en cada `PUT`** (Fase 13): razonable para el volumen de
+  un portfolio, pero si un reproductor real reportara posición cada ~5s por dispositivo activo,
+  sería una query a Postgres por cada heartbeat de cada dispositivo de cada usuario activo — límite
+  de escala documentado, no resuelto.
+- **El polling de playback comparte el presupuesto de rate limit `general`** (Fase 13) con el resto
+  de `/users`, `/auth`, `/2fa` y `/songs` del mismo usuario — dos dispositivos haciendo `PUT`+`GET`
+  cada pocos segundos consumen una porción real de ese presupuesto compartido, pudiendo interferir
+  con otras acciones legítimas del mismo usuario bajo ráfaga. Sin tier propio, aceptado.
+- **Sin gestión de dispositivos** (Fase 13): `device_id` es un string libre sin registro previo, sin
+  límite de cuántos `device_id` distintos puede usar un usuario, sin listado de dispositivos activos
+  ni revocación. Fuera de alcance de esta fase.
 
 ## Cómo escalaría esto en producción real
 
