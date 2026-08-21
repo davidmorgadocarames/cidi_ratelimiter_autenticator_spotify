@@ -3,6 +3,19 @@
 
   const state = { accessToken: null };
   let currentUser = null;
+  // Se incrementa en cada resetCatalog() (login/logout/sesión expirada). Los
+  // handlers de búsqueda/reproducción capturan su valor al empezar y lo
+  // comparan tras el await: si cambió, la respuesta es de una sesión/vista
+  // anterior (fetch en vuelo durante un logout, por ejemplo) y se descarta
+  // sin tocar el DOM. NO protege por sí solo dos clicks en "Reproducir"
+  // dentro de la misma sesión - eso lo cubren playRequestId (más abajo) y
+  // deshabilitar el botón mientras su propia petición está en vuelo.
+  let catalogGeneration = 0;
+  // Se incrementa en cada click de "Reproducir", independientemente de
+  // catalogGeneration. Garantiza que si el usuario pulsa Reproducir en dos
+  // canciones distintas seguidas, gana la última pulsada y no la que
+  // responda primero.
+  let playRequestId = 0;
 
   const loadingView = document.getElementById("loading-view");
   const authView = document.getElementById("auth-view");
@@ -50,6 +63,13 @@
   const premiumActivateError = document.getElementById("premium-activate-error");
   const premiumActivateConfirm = document.getElementById("premium-activate-confirm");
   const premiumActivateCancel = document.getElementById("premium-activate-cancel");
+
+  const searchForm = document.getElementById("search-form");
+  const searchQuery = document.getElementById("search-query");
+  const searchError = document.getElementById("search-error");
+  const searchSubmit = document.getElementById("search-submit");
+  const searchResults = document.getElementById("search-results");
+  const player = document.getElementById("song-player");
 
   const logoutBtn = document.getElementById("logout");
 
@@ -108,6 +128,57 @@
     return fetch(url, { ...options, headers });
   }
 
+  function resetCatalog() {
+    catalogGeneration += 1;
+    clearError(searchError);
+    searchQuery.value = "";
+    searchResults.textContent = "";
+    player.pause();
+    player.removeAttribute("src");
+    player.hidden = true;
+  }
+
+  function handleSessionExpired() {
+    state.accessToken = null;
+    currentUser = null;
+    resetCatalog();
+    showView("auth");
+  }
+
+  function formatDuration(seconds) {
+    if (seconds === null || seconds === undefined) return null;
+    const total = Math.round(seconds);
+    const minutes = Math.floor(total / 60);
+    const secs = String(total % 60).padStart(2, "0");
+    return `${minutes}:${secs}`;
+  }
+
+  // Construye el DOM con createElement + textContent/dataset, nunca innerHTML
+  // ni interpolación de string: title/artist vienen de canciones subidas por
+  // otros usuarios sin sanitizar (ver app/api/songs.py upload_song), no son
+  // datos de confianza.
+  function renderSearchResults(songs) {
+    for (const song of songs) {
+      const li = document.createElement("li");
+
+      const label = document.createElement("span");
+      const duration = formatDuration(song.duration_seconds);
+      label.textContent = duration
+        ? `${song.title} — ${song.artist} (${duration})`
+        : `${song.title} — ${song.artist}`;
+
+      const playButton = document.createElement("button");
+      playButton.type = "button";
+      playButton.className = "link-button";
+      playButton.textContent = "Reproducir";
+      playButton.dataset.songId = String(song.id);
+
+      li.appendChild(label);
+      li.appendChild(playButton);
+      searchResults.appendChild(li);
+    }
+  }
+
   function renderDashboard(user) {
     currentUser = user;
     dashboardEmail.textContent = user.email;
@@ -129,6 +200,8 @@
     premiumTotpCode.value = "";
     clearError(premiumActivateError);
     clearError(dashboardError);
+
+    resetCatalog();
 
     showView("dashboard");
   }
@@ -365,7 +438,100 @@
       currentUser = null;
       loginForm.reset();
       registerForm.reset();
+      resetCatalog();
       showView("auth");
+    });
+  });
+
+  searchForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const generation = catalogGeneration;
+    clearError(searchError);
+    await withLoading(searchSubmit, "Buscando…", async () => {
+      try {
+        const response = await authFetch(
+          `/songs/search?q=${encodeURIComponent(searchQuery.value)}`
+        );
+        if (generation !== catalogGeneration) return;
+
+        searchResults.textContent = "";
+
+        if (response.status === 401) {
+          showError(searchError, "Tu sesión ha expirado. Vuelve a iniciar sesión.");
+          handleSessionExpired();
+          return;
+        }
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          showError(searchError, extractErrorMessage(data, "No se pudo buscar"));
+          return;
+        }
+
+        const songs = await response.json();
+        if (songs.length === 0) {
+          const li = document.createElement("li");
+          li.textContent = "Sin resultados.";
+          searchResults.appendChild(li);
+          return;
+        }
+        renderSearchResults(songs);
+      } catch {
+        if (generation !== catalogGeneration) return;
+        searchResults.textContent = "";
+        showError(searchError, NETWORK_ERROR_MESSAGE);
+      }
+    });
+  });
+
+  searchResults.addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-song-id]");
+    if (!button) return;
+
+    const generation = catalogGeneration;
+    const requestId = ++playRequestId;
+    const songId = button.dataset.songId;
+    clearError(searchError);
+
+    // withLoading deshabilita el botón mientras su propia petición está en
+    // vuelo (evita que un doble click en LA MISMA canción dispare dos
+    // peticiones y registre el play dos veces en el backend). requestId,
+    // por separado, decide qué respuesta gana cuando se pulsa "Reproducir"
+    // en DOS canciones distintas seguidas: siempre la última pulsada, no la
+    // que responda primero.
+    await withLoading(button, null, async () => {
+      try {
+        const response = await authFetch(`/songs/${songId}/stream`);
+        if (generation !== catalogGeneration || requestId !== playRequestId) return;
+
+        if (response.status === 401) {
+          showError(searchError, "Tu sesión ha expirado. Vuelve a iniciar sesión.");
+          handleSessionExpired();
+          return;
+        }
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          showError(
+            searchError,
+            extractErrorMessage(data, "No se pudo reproducir la canción")
+          );
+          return;
+        }
+
+        const data = await response.json();
+        clearError(searchError);
+        player.src = data.url;
+        player.hidden = false;
+        try {
+          await player.play();
+        } catch {
+          // Reproducción automática bloqueada (política del navegador) u otro
+          // fallo de carga no crítico: el usuario puede darle al play nativo
+          // de los controles del <audio>.
+        }
+      } catch {
+        if (generation !== catalogGeneration || requestId !== playRequestId) return;
+        showError(searchError, NETWORK_ERROR_MESSAGE);
+      }
     });
   });
 
