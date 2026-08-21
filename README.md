@@ -267,6 +267,19 @@ Decisiones completas (por qué GHCR y no Docker Hub, por qué promover/rollback 
 operación, qué queda como diseño teórico sin servidor real) en
 [`docs/architecture.md`](docs/architecture.md).
 
+## Documentación (Fase 15)
+
+Fase puramente documental, sin cambios de código: cierra los dos huecos que
+`docs/architecture.md` dejaba explícitamente pendientes desde que se escribieron. Un diagrama
+Mermaid de la arquitectura completa (entorno local con `docker-compose`, pipeline de CI/CD hacia
+GHCR, y la distinción control plane/data plane del streaming de audio de la Fase 9), y una sección
+consolidada **"Cómo escalaría esto en producción real"** que sintetiza — sin inventar contenido
+nuevo — las notas parciales que ya habían quedado dispersas en las Fases 9, 12, 13 y 14: balanceo
+de carga y réplicas de la API, CDN delante de MinIO, Cassandra como alternativa a Redis para el
+estado de reproducción a gran escala, ventanas temporales para "popular", y el despliegue real
+pull-based ya razonado en la Fase 14. Contenido completo en
+[`docs/architecture.md`](docs/architecture.md#cómo-escalaría-esto-en-producción-real).
+
 ## Stack técnico
 
 - **Backend**: Python 3 + FastAPI
