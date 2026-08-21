@@ -20,7 +20,7 @@ diseño teórico razonado.
 
 ## Estado actual
 
-🚧 **Fases 0-14 completadas** — scaffolding del proyecto, API base con autenticación JWT
+✅ **Fases 0-15 completadas (proyecto terminado)** — scaffolding del proyecto, API base con autenticación JWT
 (registro, login, refresh con rotación y detección de reuso, logout, endpoint `/auth/me`) contra
 Postgres real, una UI mínima integrada (registro, login, dashboard) servida por la propia API,
 autenticación de dos factores (TOTP, RFC 6238) protegiendo la activación de premium, tooling de
@@ -33,9 +33,10 @@ catálogo público de canciones, streaming real con Range Requests vía URLs fir
 (control plane/data plane), búsqueda de canciones por título/artista con Meilisearch, y
 recomendaciones precalculadas por afinidad de artista con Celery, un ranking global de contenido
 popular cacheado en Redis (cache-aside con TTL), sincronización del estado de reproducción entre
-dispositivos (REST last-write-wins), y CD real publicando la imagen versionada en GitHub Container
-Registry (sin servidor real, ver esa sección). Ver el roadmap completo abajo y el detalle de qué
-está implementado vs pendiente en [`docs/architecture.md`](docs/architecture.md).
+dispositivos (REST last-write-wins), CD real publicando la imagen versionada en GitHub Container
+Registry (sin servidor real, ver esa sección), y documentación final (diagrama de arquitectura y
+diseño teórico de escalado). Ver el roadmap completo abajo y el detalle de qué está implementado
+vs pendiente en [`docs/architecture.md`](docs/architecture.md).
 
 ## Frontend: UI integrada vs frontend separado
 
