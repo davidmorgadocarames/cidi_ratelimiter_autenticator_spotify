@@ -249,16 +249,19 @@ disponible, sin cuentas ni credenciales nuevas), no como dos entornos reales:
 # caracteres del commit a promover o al que revertir.
 ```
 
-**Pasos manuales/prerrequisitos, una sola vez**:
-1. **Workflow permissions del repo** — Settings → Actions → General → Workflow permissions debe
-   permitir "Read and write permissions" (o al menos que `GITHUB_TOKEN` pueda escribir en
-   Packages); si el repo tuviera fijado "Read-only" sin "Allow GitHub Actions to create...", el
-   primer `docker push` a GHCR fallaría en el login/push. Configuración por defecto de GitHub para
-   repos nuevos, normalmente ya correcta sin tocar nada.
-2. **Visibilidad del paquete** — un paquete publicado vía `GITHUB_TOKEN` nace privado en GHCR
-   incluso en un repo público — hay que hacerlo público a mano una vez (Settings del paquete →
-   Change visibility → Public) para poder verificarlo sin token (`docker buildx imagetools inspect
-   ghcr.io/<owner>/<repo>:<tag>`, pull anónimo contra el registry).
+**Prerrequisito, una sola vez**: Settings → Actions → General → Workflow permissions debe permitir
+"Read and write permissions" (o al menos que `GITHUB_TOKEN` pueda escribir en Packages); si el repo
+tuviera fijado "Read-only" sin "Allow GitHub Actions to create...", el primer `docker push` a GHCR
+fallaría en el login/push. Configuración por defecto de GitHub para repos nuevos, normalmente ya
+correcta sin tocar nada.
+
+**Verificado empíricamente tras el primer `build-and-push` real**: a diferencia de lo que se
+esperaba durante la planificación (que el paquete naciera privado y hubiera que hacerlo público a
+mano), en la práctica quedó público automáticamente — confirmado con `docker logout ghcr.io`
+seguido de `docker buildx imagetools inspect ghcr.io/<owner>/<repo>:staging` sin ninguna sesión
+iniciada, funcionando de inmediato. Sin paso manual de visibilidad en este caso concreto — puede
+depender de la configuración de la cuenta/organización, así que si un paquete apareciera privado en
+otro entorno, Settings del paquete → Change visibility → Public lo resuelve.
 
 Decisiones completas (por qué GHCR y no Docker Hub, por qué promover/rollback son la misma
 operación, qué queda como diseño teórico sin servidor real) en

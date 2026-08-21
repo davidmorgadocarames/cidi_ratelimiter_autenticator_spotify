@@ -560,9 +560,10 @@ también que es seguro hacer público el paquete: el `Dockerfile` nunca hace `CO
 Packages de GitHub exige token incluso para paquetes públicos, a diferencia de la API de
 repos/Actions/PRs usada sin token en todas las fases anteriores — el método realmente sin-token
 para confirmar que un tag existe es `docker buildx imagetools inspect ghcr.io/<owner>/<repo>:<tag>`
-(pull anónimo contra el registry), y solo funciona después de que el usuario haga público el
-paquete la primera vez (paso manual, GHCR lo publica privado por defecto incluso en un repo
-público).
+(pull anónimo contra el registry) — se esperaba que solo funcionara tras hacer público el paquete a
+mano (GHCR lo publica privado por defecto en general), pero la verificación real tras el merge
+mostró que en este caso concreto ya era público de inmediato, sin paso manual (ver Decisiones
+técnicas más abajo para el detalle).
 
 `docker buildx imagetools create` (no un rebuild) para mover `production`: operación
 registry-a-registry que copia el manifest existente sin reconstruir ni resubir capas — promueve
@@ -1189,13 +1190,18 @@ fase en que se toma. Por ahora, las de la Fase 1:_
   documentada con un comentario ancla en el propio `cd.yml` (hallazgo de la revisión del plan) — es
   cierto hoy porque `docker` no tiene `if:` propio, solo `needs: test`, pero es una propiedad
   emergente de `ci.yml`, no algo que `cd.yml` fuerce por sí mismo.
-- **Visibilidad del paquete GHCR**: nace privado por defecto incluso en un repo público — paso
-  manual único del usuario para hacerlo público, verificado como seguro (`Dockerfile` sin `COPY .
+- **Visibilidad del paquete GHCR — corregido tras la verificación real, no solo lo anticipado en el
+  plan**: se esperaba que el paquete naciera privado por defecto y hubiera que hacerlo público a
+  mano; verificado empíricamente tras el primer `build-and-push` real (`docker logout ghcr.io` +
+  `docker buildx imagetools inspect` sin sesión) que en la práctica quedó público de inmediato, sin
+  ningún paso manual — posiblemente depende de configuración de cuenta/organización no controlada
+  por este workflow. Verificado como seguro publicarlo de todas formas (`Dockerfile` sin `COPY .
   .`, sin secretos horneados, `.env` ya excluido en `.dockerignore`).
 - **Verificación sin token usa `docker buildx imagetools inspect`, no la API REST de Packages**
-  (corrección de método encontrada en la revisión del plan): esa API exige token incluso para
-  paquetes públicos, a diferencia de la API de repos/Actions/PRs ya usada sin token en fases
-  anteriores.
+  (corrección de método encontrada en la revisión del plan, confirmada en la verificación real): la
+  API REST de Packages devuelve `401 Requires authentication` incluso sin ningún parámetro
+  especial, a diferencia de la API de repos/Actions/PRs ya usada sin token en fases anteriores;
+  `imagetools inspect` sí funciona anónimo contra el registry.
 
 ## Riesgos conocidos
 
