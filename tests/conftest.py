@@ -21,8 +21,20 @@ from app.models import (  # noqa: F401 - registra los modelos en Base.metadata
     song,
     user,
 )
-from app.services.search import _INDEX_NAME, ensure_index_exists
+from app.services import search
+from app.services.search import ensure_index_exists
 from app.services.storage import ensure_bucket_exists
+
+# Aísla el índice de Meilisearch que usan los tests del que usa la app de desarrollo
+# real - sin esto, _clean_index (abajo) vacía el índice "songs" compartido con
+# cualquier `docker compose up` corriendo en paralelo (incidente real: verificando
+# el seed de Kaggle, correr la suite borró la búsqueda de canciones reales
+# sembradas, ver docs/architecture.md). search.py resuelve _INDEX_NAME como global
+# de módulo en cada llamada (index_song/search_songs/ensure_index_exists), así que
+# reasignarlo aquí, UNA vez al importar conftest.py (antes de que corra cualquier
+# fixture o request de TestClient), redirige también las llamadas INDIRECTAS que
+# disparan los endpoints reales bajo TestClient, no solo las de este archivo.
+search._INDEX_NAME = settings.meilisearch_test_index_name
 
 test_engine = create_engine(settings.test_database_url)
 TestSessionLocal = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
@@ -93,7 +105,7 @@ def _clean_index() -> Generator[None, None, None]:
     _clean_bucket/_flush_redis. Espera la task antes de continuar, para que
     el índice quede realmente vacío antes de que empiece el siguiente test."""
     yield
-    index = test_meilisearch.index(_INDEX_NAME)
+    index = test_meilisearch.index(settings.meilisearch_test_index_name)
     task_info = index.delete_all_documents()
     test_meilisearch.wait_for_task(task_info.task_uid)
 

@@ -9,7 +9,10 @@ from app.models.song import Song
 
 logger = logging.getLogger(__name__)
 
-_INDEX_NAME = "songs"
+# Global de módulo, no capturado por closure - index_song/search_songs/
+# ensure_index_exists lo resuelven en cada llamada, lo que permite a
+# tests/conftest.py reasignarlo a un índice separado sin tocar esta lógica.
+_INDEX_NAME = settings.meilisearch_index_name
 # 10s, no 5s: bajo carga de CI (matriz de 3 versiones de Python compartiendo
 # runner) una task puede tardar más - un timeout corto aquí no hace fallar la
 # subida (index_song sigue siendo best-effort), pero SÍ puede dejar la canción
@@ -21,6 +24,20 @@ _TASK_TIMEOUT_MS = 10000
 # una request de POST /songs colgada mientras intenta indexar, en vez de
 # fallar rápido y devolver igualmente 201 (misma lección de Fase 8 con boto3).
 _client = Client(settings.meilisearch_url, settings.meilisearch_api_key, timeout=5)
+
+
+def is_healthy() -> bool:
+    """Comprobación barata de disponibilidad (sin autenticación de por medio).
+    Usada por app/cli/reindex_catalog.py para distinguir "Meilisearch caído"
+    de "esta fila en concreto tiene datos malos" ANTES de empezar a
+    reindexar, en vez de inferirlo de fallos consecutivos de index_song -
+    unos pocos documentos con datos corruptos no deberían poder abortar la
+    reindexación de un catálogo entero sano (hallazgo de la revisión)."""
+    try:
+        _client.health()
+    except Exception:
+        return False
+    return True
 
 
 def ensure_index_exists() -> None:

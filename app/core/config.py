@@ -37,6 +37,11 @@ class Settings(BaseSettings):
 
     meilisearch_url: str = "http://localhost:7700"
     meilisearch_api_key: str = "change-me"
+    meilisearch_index_name: str = "songs"
+    # Índice separado para tests/conftest.py - sin esto, la fixture autouse
+    # _clean_index vaciaría el mismo índice que usa la app de desarrollo real
+    # (incidente real, ver docs/architecture.md).
+    meilisearch_test_index_name: str = "songs_test"
 
     # Broker de Celery (Fase 11) - mismo Redis que redis_url pero DB 1, no DB 0:
     # evita que el flushdb() autouse de los tests (o un futuro flush operacional

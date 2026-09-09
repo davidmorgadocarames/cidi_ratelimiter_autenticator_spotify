@@ -1440,15 +1440,41 @@ reinicio del `catalog_server` sin conflicto de puerto, reproducción funcionando
   consumo vía `fetch()`/MediaSource sí lo exigiría, y hoy el bucket no tiene ninguna configuración
   de CORS. Ninguno de los dos se ha implementado — quedan fuera del alcance de esta fase (solo
   desarrollo local/Docker Compose), documentados aquí para no perderlos de vista.
-- **Canciones subidas antes de la Fase 10 no están indexadas** (Fase 10): sin backfill/script de
-  reindexación en el alcance actual — solo se indexan canciones que pasan por `upload_song` a
-  partir de esta fase. Quedarían invisibles a `GET /songs/search` (aunque sí siguen apareciendo en
-  `GET /songs`) hasta una reindexación manual futura.
+- ~~Canciones subidas antes de la Fase 10 no están indexadas~~ — **mitigado (fuera de fases,
+  sesión posterior a la Fase 15)**: `app/cli/reindex_catalog.py` reindexa bajo demanda todas las
+  `Song` con `status="ready"`, idempotente por `id` (`docker compose exec app python -m
+  app.cli.reindex_catalog`). Sigue sin ser automático (hay que correrlo a mano), pero ya no hace
+  falta un script ad-hoc improvisado cada vez. Comprueba la disponibilidad de Meilisearch UNA vez
+  al principio (`search.is_healthy()`) para fallar rápido si está caído, en vez de inferirlo de
+  fallos de indexación fila a fila (que pueden deberse a datos corruptos en una fila concreta, no
+  a que el buscador esté inalcanzable — hallazgo de la revisión). **Sin *batching***: un
+  `add_documents`+`wait_for_task` secuencial por canción (mismo patrón que `index_song`, reutilizado
+  tal cual) — aceptable para el tamaño de catálogo real de este portfolio (`seed_catalog.py` ya
+  acota `--limit` a un máximo de 1000), pero no escalaría bien a un catálogo mucho mayor.
 - **Sin reconciliación automática si la indexación falla** (Fase 10): si `index_song` falla (best
   effort, ver Decisiones técnicas), no hay retry ni cola que reintente más tarde — la canción queda
   reproducible pero invisible a la búsqueda. La Fase 11 introdujo Celery pero acotado a
   recomendaciones (ver esa sección), este gap sigue sin resolver, mismo principio que las filas
-  atascadas en `status="processing"` de la Fase 8.
+  atascadas en `status="processing"` de la Fase 8. Mitigación manual disponible:
+  `app/cli/reindex_catalog.py` (ver arriba).
+- ~~Índice de Meilisearch compartido entre tests y desarrollo~~ — **resuelto (fuera de fases,
+  sesión posterior a la Fase 15)**: incidente real — `tests/conftest.py` usaba el mismo índice
+  `"songs"` que la app de desarrollo; la fixture autouse `_clean_index` lo vaciaba después de
+  cada test, y correr la suite dentro de un contenedor Docker para verificar el seed de Kaggle
+  borró en silencio la búsqueda de canciones reales sembradas (Postgres, con
+  `TEST_DATABASE_URL` separada, no se vio afectado). Arreglado con dos settings hermanos
+  (`MEILISEARCH_INDEX_NAME=songs` / `MEILISEARCH_TEST_INDEX_NAME=songs_test`, mismo patrón que
+  `DATABASE_URL`/`TEST_DATABASE_URL`) — `tests/conftest.py` reasigna
+  `app.services.search._INDEX_NAME` una vez al importarse, lo que redirige también las llamadas
+  indirectas de los endpoints reales bajo `TestClient`. Dos notas operativas relacionadas:
+  - `docker compose down -v` borraría también `"songs_test"` junto con `"songs"` (mismo volumen
+    `meilisearch_data`) — totalmente recuperable con `app/cli/reindex_catalog.py`, ya que Postgres
+    sigue siendo la fuente de verdad.
+  - Si se repite el procedimiento ad-hoc de correr `pytest` dentro del contenedor `app` (`docker
+    cp tests/...` + `pip install -r requirements-dev.txt`), sigue haciendo falta pasar
+    `TEST_DATABASE_URL` apuntando al hostname interno `postgres` (no al `localhost` de `.env`,
+    que dentro del contenedor no resuelve a nada) — ver la sección "Seed de catálogo desde
+    Kaggle" más arriba, donde se documentó por primera vez.
 - **Meilisearch de un único nodo, sin réplica** (Fase 10): mismo riesgo ya aceptado para
   Postgres/MinIO en fases anteriores — sin alta disponibilidad, aceptado para el alcance de un
   proyecto de portfolio.
