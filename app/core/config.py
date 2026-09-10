@@ -50,6 +50,23 @@ class Settings(BaseSettings):
     # que redis_url), sin validador anti-"change-me".
     celery_broker_url: str = "redis://localhost:6379/1"
 
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_from_email: str = "noreply@cidi-spotify-clone.local"
+    email_verification_token_expire_hours: int = 24
+    # Análogo a s3_public_endpoint_url: el host que debe poder resolver el
+    # NAVEGADOR del usuario para el enlace del email, no necesariamente el mismo
+    # que usa este proceso para hablar con Mailhog (smtp_host, arriba). No se
+    # sobreescribe en docker-compose.yml (igual que s3_public_endpoint_url no
+    # sobreescribe su propio default ahí) - localhost:8000 ya es correcto tanto
+    # en Docker Compose como en local.
+    app_public_url: str = "http://localhost:8000"
+    # Solo usada por tests/conftest.py, para inspeccionar correos capturados vía
+    # la API de Mailhog - mismo rol que meilisearch_url cumple para
+    # test_meilisearch. Mailhog no exige autenticación SMTP, ninguna de estas
+    # settings es secreta - sin validador anti-"change-me".
+    mailhog_api_url: str = "http://localhost:8025"
+
     @field_validator("jwt_secret_key")
     @classmethod
     def _reject_placeholder_secret(cls, value: str) -> str:

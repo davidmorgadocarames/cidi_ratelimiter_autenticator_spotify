@@ -24,6 +24,24 @@ class User(Base):
         TIMESTAMP(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # default=False (Python) pero server_default="true" (DB) - deliberadamente
+    # distintos. El default de Python es lo que aplica a cada User(...) nuevo
+    # creado por register() (SQLAlchemy incluye el valor calculado en el INSERT,
+    # el server_default no llega a intervenir) - los registros NUEVOS nacen sin
+    # verificar. El server_default="true" es la política de backfill que aplica
+    # la propia migración a las filas YA EXISTENTES - sin esto, aplicar la
+    # migración dejaría esas cuentas bloqueadas de login de la noche a la
+    # mañana por una verificación que nunca se les pidió hacer.
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="true", nullable=False
+    )
+    email_verification_token_hash: Mapped[str | None] = mapped_column(
+        String(64), unique=True, index=True, nullable=True
+    )
+    email_verification_token_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
     # --- 2FA (TOTP) ---
     # "Activado" (totp_enabled, ver abajo) exige AMBAS no-nulas: secreto guardado
     # y confirmado con un código válido. Mientras solo hay secreto pero no

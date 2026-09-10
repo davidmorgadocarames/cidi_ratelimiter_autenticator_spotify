@@ -59,6 +59,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
+      mailhog:
+        # A diferencia de MinIO, la imagen no requiere argumentos de comando
+        # (arranca con su ENTRYPOINT por defecto) - sí puede usar el bloque
+        # declarativo "services:". Verificado empíricamente que la imagen NO
+        # trae curl, solo wget (ver docker-compose.yml).
+        image: mailhog/mailhog:v1.0.1
+        ports:
+          - 1025:1025
+          - 8025:8025
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://localhost:8025/api/v2/messages"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       DATABASE_URL: postgresql+psycopg://user:password@localhost:5432/spotify_clone
@@ -86,6 +100,9 @@ jobs:
       # negocio directamente contra Postgres/Redis reales, sin pasar por un
       # broker real (ver tests/test_recommendations.py).
       CELERY_BROKER_URL: redis://localhost:6379/1
+      SMTP_HOST: localhost
+      SMTP_PORT: "1025"
+      MAILHOG_API_URL: http://localhost:8025
 
     steps:
       - uses: actions/checkout@v4

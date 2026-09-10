@@ -25,12 +25,17 @@ class UserRead(BaseModel):
     is_active: bool
     is_premium: bool
     totp_enabled: bool
+    email_verified: bool
     created_at: datetime
 
 
 class PremiumActivateRequest(BaseModel):
     password: str
     totp_code: str = Field(pattern=r"^\d{6}$")
+
+
+class ResendVerificationRequest(BaseModel):
+    email: EmailStr
 
 
 class Token(BaseModel):

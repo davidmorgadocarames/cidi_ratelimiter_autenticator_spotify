@@ -1,10 +1,15 @@
+import email
+import email.policy
 import os
 import subprocess
 import tempfile
 from collections.abc import Generator, Iterator
+from email.message import EmailMessage
 from pathlib import Path
+from typing import Any, cast
 
 import boto3
+import httpx
 import pytest
 import redis as redis_sync
 from fastapi.testclient import TestClient
@@ -129,6 +134,57 @@ def _flush_redis() -> Generator[None, None, None]:
     conocida (no compatible con pytest-xdist real, no usado en este proyecto)."""
     test_redis.flushdb()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _flush_mailhog() -> Generator[None, None, None]:
+    """Vacía los correos capturados por Mailhog entre tests, mismo patrón que
+    _clean_bucket/_clean_index. DELETE /api/v1/messages (no hay equivalente en
+    v2) - verificado empíricamente contra el contenedor real."""
+    yield
+    httpx.delete(f"{settings.mailhog_api_url}/api/v1/messages", timeout=5)
+
+
+def mark_email_verified(email: str) -> None:
+    """Utilidad para los helpers _register_and_login ya existentes en otros
+    archivos de test (test_songs.py, test_totp.py, etc.) - saltan el flujo
+    real de verificación de email porque no es lo que están probando. Update
+    directo (no pasa por Session/ORM) porque se llama desde fuera del ciclo
+    de vida normal de un test con fixtures inyectadas."""
+    with test_engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET email_verified = true WHERE email = :email"),
+            {"email": email},
+        )
+
+
+def get_mailhog_messages() -> list[dict[str, Any]]:
+    """Lista los correos capturados por Mailhog vía su API real (GET
+    /api/v2/messages) - usado por tests/test_email_verification.py para
+    confirmar que un email se envió de verdad, sin mockear smtplib."""
+    response = httpx.get(f"{settings.mailhog_api_url}/api/v2/messages", timeout=5)
+    response.raise_for_status()
+    items: list[dict[str, Any]] = response.json()["items"]
+    return items
+
+
+def decode_mailhog_body(message: dict[str, Any]) -> str:
+    """El campo "Body" de la API v2 viene tal cual salió por SMTP, es decir
+    todavía codificado quoted-printable (líneas cortadas con "=\\r\\n", "="
+    escapado como "=3D") - encontrado empíricamente probando contra un
+    contenedor real: un regex ingenuo sobre "Body" corta el token a mitad de
+    línea. "Raw.Data" trae el mensaje MIME completo tal cual, que el propio
+    parser de email de la stdlib sabe decodificar de verdad."""
+    raw = message["Raw"]["Data"]
+    # email.message_from_string() está tipado en typeshed para devolver el
+    # Message genérico de compat32 aunque se le pase policy=default en
+    # runtime (donde sí devuelve un EmailMessage real, con get_content()) -
+    # cast explícito, no un # type: ignore genérico.
+    parsed = cast(
+        EmailMessage, email.message_from_string(raw, policy=email.policy.default)
+    )
+    content: str = parsed.get_content()
+    return content
 
 
 def _override_get_db() -> Iterator[Session]:

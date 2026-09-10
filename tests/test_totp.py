@@ -2,6 +2,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 
 import pyotp
+from conftest import mark_email_verified
 from fastapi.testclient import TestClient
 from httpx import Response
 from sqlalchemy.orm import Session
@@ -16,6 +17,7 @@ def _register_and_login(
     client: TestClient, email: str = "totp@example.com", password: str = PASSWORD
 ) -> str:
     client.post("/auth/register", json={"email": email, "password": password})
+    mark_email_verified(email)
     login_response = client.post(
         "/auth/login", data={"username": email, "password": password}
     )

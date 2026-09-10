@@ -94,6 +94,21 @@ services:
       timeout: 5s
       retries: 5
 
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI / API (inspeccionar correos capturados en desarrollo)
+    healthcheck:
+      # Verificado empíricamente: la imagen NO trae curl, solo wget (a
+      # diferencia de MinIO/Meilisearch) - "wget -q -O /dev/null" en vez de
+      # "curl -f".
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8025/api/v2/messages"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   app:
     build: .
     restart: unless-stopped
@@ -106,6 +121,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       MEILISEARCH_URL: http://meilisearch:7700
+      SMTP_HOST: mailhog
       # Default real es True (config.py) - sobre HTTP local sin este override el
       # navegador/curl no reenvía la cookie Secure del refresh token.
       COOKIE_SECURE: "false"
