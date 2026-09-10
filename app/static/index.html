@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CIDI Spotify Clone</title>
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/screen3.css">
 </head>
 <body>
   <main id="loading-view">
@@ -53,6 +54,8 @@
   <main id="dashboard-view" hidden>
     <h1>CIDI Spotify Clone</h1>
     <p>Sesión iniciada como <strong id="dashboard-email"></strong></p>
+    <p class="hint" id="gate-hint">Activa premium y confirma el 2FA para acceder a la app de música.</p>
+    <button type="button" id="back-to-app" class="link-button" hidden>Volver a la app de música</button>
 
     <section id="security-section">
       <h2>Seguridad</h2>
@@ -97,21 +100,87 @@
       </div>
     </section>
 
-    <section id="catalog-section">
-      <h2>Canciones</h2>
-      <form id="search-form" novalidate>
-        <label for="search-query">Buscar</label>
-        <input id="search-query" type="search" required placeholder="Título o artista">
-        <p class="error" id="search-error" role="alert" tabindex="-1" hidden></p>
-        <button type="submit" id="search-submit">Buscar</button>
-      </form>
-      <ul id="search-results" aria-live="polite"></ul>
-      <audio id="song-player" controls hidden></audio>
-    </section>
-
     <button type="button" id="logout">Cerrar sesión</button>
   </main>
 
-  <script src="/app.js"></script>
+  <main id="app-view" hidden>
+    <div class="blob blob-1" aria-hidden="true"></div>
+    <div class="blob blob-2" aria-hidden="true"></div>
+    <div class="blob blob-3" aria-hidden="true"></div>
+
+    <header id="topbar" class="glass-panel">
+      <span id="topbar-brand">Aurora</span>
+
+      <div id="topbar-playlists">
+        <button type="button" id="new-playlist-button">+ Nueva playlist</button>
+        <label for="playlist-selector" class="visually-hidden">Playlist seleccionada</label>
+        <select id="playlist-selector"></select>
+      </div>
+
+      <div id="topbar-actions">
+        <button type="button" id="back-to-gate" class="link-button">Seguridad y Premium</button>
+        <button type="button" id="app-logout" class="link-button">Cerrar sesión</button>
+      </div>
+    </header>
+
+    <p class="error" id="app-error" role="alert" tabindex="-1" hidden></p>
+
+    <div id="main-panels">
+      <section id="discovery-panel" class="glass-panel">
+        <h2>Descubrimiento semanal</h2>
+        <ul id="discovery-list" aria-live="polite"></ul>
+      </section>
+
+      <section id="playlist-panel" class="glass-panel">
+        <h2 id="playlist-panel-title">Tu lista</h2>
+        <p class="hint" id="playlist-panel-meta"></p>
+        <ul id="playlist-songs" aria-live="polite"></ul>
+        <div id="playlist-empty-state" hidden>
+          <p>Arrastra canciones aquí para crear tu playlist</p>
+        </div>
+      </section>
+    </div>
+
+    <footer id="player-bar" class="glass-panel" hidden>
+      <div id="player-track-info">
+        <div class="cover-art" id="player-cover" aria-hidden="true"></div>
+        <div>
+          <p id="player-song-title"></p>
+          <p class="hint" id="player-song-artist"></p>
+        </div>
+      </div>
+
+      <div id="player-controls">
+        <button type="button" id="player-prev" aria-label="Canción anterior">⏮</button>
+        <button type="button" id="player-play-pause" aria-label="Reproducir">▶</button>
+        <button type="button" id="player-next" aria-label="Canción siguiente">⏭</button>
+        <label for="player-progress" class="visually-hidden">Progreso</label>
+        <input type="range" id="player-progress" min="0" max="100" value="0">
+        <span class="hint" id="player-time">0:00 / 0:00</span>
+      </div>
+
+      <div id="player-volume-wrap">
+        <label for="player-volume" class="hint">Vol</label>
+        <input type="range" id="player-volume" min="0" max="1" step="0.01" value="1">
+      </div>
+
+      <audio id="app-player"></audio>
+    </footer>
+
+    <div id="create-playlist-modal" class="modal-backdrop" hidden>
+      <div class="modal glass-panel" role="dialog" aria-modal="true" aria-labelledby="create-playlist-title">
+        <h2 id="create-playlist-title">Nueva playlist</h2>
+        <label for="new-playlist-name">Nombre</label>
+        <input id="new-playlist-name" type="text" maxlength="200" autocomplete="off">
+        <p class="error" id="create-playlist-error" role="alert" tabindex="-1" hidden></p>
+        <div class="modal-actions">
+          <button type="button" id="create-playlist-confirm">Crear</button>
+          <button type="button" id="create-playlist-cancel" class="link-button">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

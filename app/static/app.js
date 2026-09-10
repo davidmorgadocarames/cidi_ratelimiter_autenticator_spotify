@@ -1,574 +1,101 @@
-(() => {
-  const NETWORK_ERROR_MESSAGE = "Error de red. Inténtalo de nuevo.";
+import { appState, authFetch } from "./js/app-state.js";
+import { initScreen1 } from "./js/screen1-auth.js";
+import { initScreen2 } from "./js/screen2-gate.js";
+import { initScreen3 } from "./js/screen3/index.js";
 
-  const state = { accessToken: null };
-  let currentUser = null;
-  // Se incrementa en cada resetCatalog() (login/logout/sesión expirada). Los
-  // handlers de búsqueda/reproducción capturan su valor al empezar y lo
-  // comparan tras el await: si cambió, la respuesta es de una sesión/vista
-  // anterior (fetch en vuelo durante un logout, por ejemplo) y se descarta
-  // sin tocar el DOM. NO protege por sí solo dos clicks en "Reproducir"
-  // dentro de la misma sesión - eso lo cubren playRequestId (más abajo) y
-  // deshabilitar el botón mientras su propia petición está en vuelo.
-  let catalogGeneration = 0;
-  // Se incrementa en cada click de "Reproducir", independientemente de
-  // catalogGeneration. Garantiza que si el usuario pulsa Reproducir en dos
-  // canciones distintas seguidas, gana la última pulsada y no la que
-  // responda primero.
-  let playRequestId = 0;
+const loadingView = document.getElementById("loading-view");
+const authView = document.getElementById("auth-view");
+const gateView = document.getElementById("dashboard-view");
+const appView = document.getElementById("app-view");
 
-  const loadingView = document.getElementById("loading-view");
-  const authView = document.getElementById("auth-view");
-  const dashboardView = document.getElementById("dashboard-view");
+const backToGateBtn = document.getElementById("back-to-gate");
+const appLogoutBtn = document.getElementById("app-logout");
 
-  const loginSection = document.getElementById("login-section");
-  const registerSection = document.getElementById("register-section");
-
-  const loginForm = document.getElementById("login-form");
-  const loginEmail = document.getElementById("login-email");
-  const loginPassword = document.getElementById("login-password");
-  const loginError = document.getElementById("login-error");
-  const loginSubmit = document.getElementById("login-submit");
-
-  const registerForm = document.getElementById("register-form");
-  const registerEmail = document.getElementById("register-email");
-  const registerPassword = document.getElementById("register-password");
-  const registerError = document.getElementById("register-error");
-  const registerSubmit = document.getElementById("register-submit");
-
-  const showRegisterBtn = document.getElementById("show-register");
-  const showLoginBtn = document.getElementById("show-login");
-
-  const resendVerificationBtn = document.getElementById("resend-verification");
-  const resendVerificationHint = document.getElementById("resend-verification-hint");
-
-  const dashboardEmail = document.getElementById("dashboard-email");
-
-  const totpStatus = document.getElementById("totp-status");
-  const totpSetupStart = document.getElementById("totp-setup-start");
-  const totpSetupPassword = document.getElementById("totp-setup-password");
-  const totpSetupError = document.getElementById("totp-setup-error");
-  const totpSetupButton = document.getElementById("totp-setup-button");
-  const totpConfirmSection = document.getElementById("totp-confirm-section");
-  const totpQr = document.getElementById("totp-qr");
-  const totpSecret = document.getElementById("totp-secret");
-  const totpConfirmCode = document.getElementById("totp-confirm-code");
-  const totpConfirmError = document.getElementById("totp-confirm-error");
-  const totpConfirmButton = document.getElementById("totp-confirm-button");
-
-  const premiumStatus = document.getElementById("premium-status");
-  const dashboardError = document.getElementById("dashboard-error");
-  const togglePremiumBtn = document.getElementById("toggle-premium");
-  const premiumNeeds2faHint = document.getElementById("premium-needs-2fa-hint");
-  const premiumActivateForm = document.getElementById("premium-activate-form");
-  const premiumPassword = document.getElementById("premium-password");
-  const premiumTotpCode = document.getElementById("premium-totp-code");
-  const premiumActivateError = document.getElementById("premium-activate-error");
-  const premiumActivateConfirm = document.getElementById("premium-activate-confirm");
-  const premiumActivateCancel = document.getElementById("premium-activate-cancel");
-
-  const searchForm = document.getElementById("search-form");
-  const searchQuery = document.getElementById("search-query");
-  const searchError = document.getElementById("search-error");
-  const searchSubmit = document.getElementById("search-submit");
-  const searchResults = document.getElementById("search-results");
-  const player = document.getElementById("song-player");
-
-  const logoutBtn = document.getElementById("logout");
-
-  function showView(view) {
-    loadingView.hidden = view !== "loading";
-    authView.hidden = view !== "auth";
-    dashboardView.hidden = view !== "dashboard";
+// "gate" (Pantalla 2: premium+seguridad) y "app" (Pantalla 3: la app de
+// música) son dos pantallas distintas post-login - showView() ya no es
+// binario "dashboard sí/no" como antes de esta pieza.
+function showView(view) {
+  loadingView.hidden = view !== "loading";
+  authView.hidden = view !== "auth";
+  gateView.hidden = view !== "gate";
+  appView.hidden = view !== "app";
+  if (view !== "app") {
+    screen3.leave();
   }
+}
 
-  function showError(el, message) {
-    el.textContent = message;
-    el.hidden = false;
+async function fetchMe() {
+  const response = await authFetch("/auth/me");
+  if (!response.ok) throw new Error("No se pudo obtener el usuario actual");
+  return response.json();
+}
+
+function handleSessionExpired() {
+  appState.accessToken = null;
+  appState.currentUser = null;
+  screen1.reset();
+  showView("auth");
+}
+
+async function logout() {
+  try {
+    await fetch("/auth/logout", { method: "POST" });
+  } catch {
+    // Best-effort: aunque falle la llamada de red, seguimos cerrando la
+    // sesión en el cliente (el refresh token en el servidor expira solo).
   }
+  handleSessionExpired();
+}
 
-  function clearError(el) {
-    el.textContent = "";
-    el.hidden = true;
+// Único sitio que decide Pantalla 2 vs Pantalla 3 - se llama tras login,
+// refresh silencioso, confirmar TOTP, y activar/desactivar premium (los
+// cuatro momentos en los que is_premium/totp_enabled pueden haber cambiado).
+function routeAfterAuth(user) {
+  appState.currentUser = user;
+  screen2.render(user);
+  if (user.is_premium && user.totp_enabled) {
+    showView("app");
+    screen3.enter(user);
+  } else {
+    showView("gate");
   }
+}
 
-  // FastAPI/Pydantic devuelve `detail` como string en errores "de negocio"
-  // (HTTPException) pero como una LISTA de objetos {loc, msg, type} en errores
-  // 422 de validación de body. Sin esto, `data.detail || fallback` asigna el
-  // array a textContent y el usuario ve literalmente "[object Object]".
-  function extractErrorMessage(data, fallback) {
-    const detail = data && data.detail;
-    if (typeof detail === "string" && detail.length > 0) return detail;
-    if (Array.isArray(detail) && detail.length > 0 && typeof detail[0]?.msg === "string") {
-      return detail[0].msg;
+async function refreshUserAndRoute() {
+  try {
+    const user = await fetchMe();
+    routeAfterAuth(user);
+  } catch {
+    handleSessionExpired();
+  }
+}
+
+async function trySilentRefresh() {
+  try {
+    const response = await fetch("/auth/refresh", { method: "POST" });
+    if (!response.ok) {
+      showView("auth");
+      return;
     }
-    return fallback;
-  }
-
-  // button.dataset.loading marca explícitamente "este botón sigue mostrando su
-  // label de carga"; si algo (ej. renderDashboard) ya puso el label definitivo
-  // durante fn(), lo borra para que el finally de abajo no lo pise de vuelta.
-  async function withLoading(button, labelWhileLoading, fn) {
-    const originalLabel = button.textContent;
-    button.disabled = true;
-    if (labelWhileLoading) {
-      button.textContent = labelWhileLoading;
-      button.dataset.loading = "true";
-    }
-    try {
-      await fn();
-    } finally {
-      button.disabled = false;
-      if (button.dataset.loading === "true") {
-        button.textContent = originalLabel;
-      }
-      delete button.dataset.loading;
-    }
-  }
-
-  function authFetch(url, options = {}) {
-    const headers = { ...(options.headers || {}), Authorization: `Bearer ${state.accessToken}` };
-    return fetch(url, { ...options, headers });
-  }
-
-  function resetCatalog() {
-    catalogGeneration += 1;
-    clearError(searchError);
-    searchQuery.value = "";
-    searchResults.textContent = "";
-    player.pause();
-    player.removeAttribute("src");
-    player.hidden = true;
-  }
-
-  function handleSessionExpired() {
-    state.accessToken = null;
-    currentUser = null;
-    resetCatalog();
+    const data = await response.json();
+    appState.accessToken = data.access_token;
+    await refreshUserAndRoute();
+  } catch {
     showView("auth");
   }
+}
 
-  function formatDuration(seconds) {
-    if (seconds === null || seconds === undefined) return null;
-    const total = Math.round(seconds);
-    const minutes = Math.floor(total / 60);
-    const secs = String(total % 60).padStart(2, "0");
-    return `${minutes}:${secs}`;
-  }
+const screen1 = initScreen1({ fetchMe, onAuthenticated: routeAfterAuth });
+const screen2 = initScreen2({ onUserUpdated: refreshUserAndRoute, logout });
+// onGateLost reutiliza refreshUserAndRoute (re-fetch + reevaluar el gate) -
+// cubre tanto un 403 real de /playlists/* (premium/2FA revocado en otra
+// pestaña mientras el usuario seguía en la Pantalla 3) como el botón
+// "Volver a la app" de la Pantalla 2 (mismo flujo, sentido inverso).
+const screen3 = initScreen3({ handleSessionExpired, onGateLost: refreshUserAndRoute });
 
-  // Construye el DOM con createElement + textContent/dataset, nunca innerHTML
-  // ni interpolación de string: title/artist vienen de canciones subidas por
-  // otros usuarios sin sanitizar (ver app/api/songs.py upload_song), no son
-  // datos de confianza.
-  function renderSearchResults(songs) {
-    for (const song of songs) {
-      const li = document.createElement("li");
+backToGateBtn.addEventListener("click", () => {
+  showView("gate");
+});
+appLogoutBtn.addEventListener("click", () => logout());
 
-      const label = document.createElement("span");
-      const duration = formatDuration(song.duration_seconds);
-      label.textContent = duration
-        ? `${song.title} — ${song.artist} (${duration})`
-        : `${song.title} — ${song.artist}`;
-
-      const playButton = document.createElement("button");
-      playButton.type = "button";
-      playButton.className = "link-button";
-      playButton.textContent = "Reproducir";
-      playButton.dataset.songId = String(song.id);
-
-      li.appendChild(label);
-      li.appendChild(playButton);
-      searchResults.appendChild(li);
-    }
-  }
-
-  function renderDashboard(user) {
-    currentUser = user;
-    dashboardEmail.textContent = user.email;
-
-    totpStatus.textContent = user.totp_enabled ? "Activado" : "No configurado";
-    totpSetupStart.hidden = user.totp_enabled;
-    totpConfirmSection.hidden = true;
-    clearError(totpSetupError);
-    clearError(totpConfirmError);
-    totpSetupPassword.value = "";
-    totpConfirmCode.value = "";
-
-    premiumStatus.textContent = user.is_premium ? "Sí" : "No";
-    togglePremiumBtn.textContent = user.is_premium ? "Desactivar premium" : "Activar premium";
-    delete togglePremiumBtn.dataset.loading;
-    premiumNeeds2faHint.hidden = true;
-    premiumActivateForm.hidden = true;
-    premiumPassword.value = "";
-    premiumTotpCode.value = "";
-    clearError(premiumActivateError);
-    clearError(dashboardError);
-
-    resetCatalog();
-
-    showView("dashboard");
-  }
-
-  async function fetchMe() {
-    const response = await authFetch("/auth/me");
-    if (!response.ok) throw new Error("No se pudo obtener el usuario actual");
-    return response.json();
-  }
-
-  async function trySilentRefresh() {
-    try {
-      const response = await fetch("/auth/refresh", { method: "POST" });
-      if (!response.ok) {
-        showView("auth");
-        return;
-      }
-      const data = await response.json();
-      state.accessToken = data.access_token;
-      const user = await fetchMe();
-      renderDashboard(user);
-    } catch {
-      showView("auth");
-    }
-  }
-
-  loginForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    clearError(loginError);
-    await withLoading(loginSubmit, "Iniciando sesión…", async () => {
-      try {
-        const body = new URLSearchParams();
-        body.set("username", loginEmail.value);
-        body.set("password", loginPassword.value);
-        const response = await fetch("/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body,
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(loginError, extractErrorMessage(data, "No se pudo iniciar sesión"));
-          loginPassword.focus();
-          return;
-        }
-        const data = await response.json();
-        state.accessToken = data.access_token;
-        const user = await fetchMe();
-        renderDashboard(user);
-      } catch {
-        showError(loginError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  registerForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    clearError(registerError);
-    await withLoading(registerSubmit, "Creando cuenta…", async () => {
-      try {
-        const response = await fetch("/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email: registerEmail.value, password: registerPassword.value }),
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(registerError, extractErrorMessage(data, "No se pudo crear la cuenta"));
-          registerEmail.focus();
-          return;
-        }
-
-        // Ya NO se intenta un auto-login: la cuenta nace con email_verified=false
-        // (ver app/api/auth.py::register), así que un POST /auth/login aquí
-        // fallaría con 403 el 100% de las veces por construcción - además de
-        // ser una llamada desperdiciada, consumía un token del bucket
-        // "sensitive" de login (capacidad 5) sin ningún beneficio, dejando
-        // menos margen al usuario para reintentos reales (hallazgo de la
-        // revisión "abogado del diablo" sobre la implementación). En su lugar,
-        // se cambia directo a la vista de login con email Y contraseña
-        // precargados y un aviso de que debe verificar su correo.
-        loginEmail.value = registerEmail.value;
-        loginPassword.value = registerPassword.value;
-        registerSection.hidden = true;
-        loginSection.hidden = false;
-        showError(
-          loginError,
-          "Cuenta creada. Revisa tu correo para verificar tu email antes de iniciar sesión."
-        );
-      } catch {
-        showError(registerError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  showRegisterBtn.addEventListener("click", () => {
-    clearError(loginError);
-    registerEmail.value = loginEmail.value;
-    loginSection.hidden = true;
-    registerSection.hidden = false;
-    registerEmail.focus();
-  });
-
-  showLoginBtn.addEventListener("click", () => {
-    clearError(registerError);
-    loginEmail.value = registerEmail.value;
-    registerSection.hidden = true;
-    loginSection.hidden = false;
-    loginEmail.focus();
-  });
-
-  resendVerificationBtn.addEventListener("click", async () => {
-    // Solo una de las dos secciones (#login-section / #register-section) está
-    // visible a la vez - mirar el atributo "hidden" es la regla sin ambigüedad
-    // para decidir de cuál tomar el email (mismo criterio que ya usa
-    // showView() para las vistas de nivel superior).
-    const email = loginSection.hidden ? registerEmail.value : loginEmail.value;
-    resendVerificationHint.hidden = true;
-    if (!email) {
-      resendVerificationHint.textContent = "Escribe tu email arriba primero.";
-      resendVerificationHint.hidden = false;
-      return;
-    }
-    await withLoading(resendVerificationBtn, "Enviando…", async () => {
-      try {
-        const response = await fetch("/auth/resend-verification", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ email }),
-        });
-        const data = await response.json().catch(() => ({}));
-        resendVerificationHint.textContent = extractErrorMessage(
-          data,
-          "No se pudo reenviar el email."
-        );
-        resendVerificationHint.hidden = false;
-      } catch {
-        resendVerificationHint.textContent = NETWORK_ERROR_MESSAGE;
-        resendVerificationHint.hidden = false;
-      }
-    });
-  });
-
-  totpSetupButton.addEventListener("click", async () => {
-    clearError(totpSetupError);
-    await withLoading(totpSetupButton, "Configurando…", async () => {
-      try {
-        const response = await authFetch("/2fa/setup", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ password: totpSetupPassword.value }),
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(totpSetupError, extractErrorMessage(data, "No se pudo configurar 2FA"));
-          totpSetupPassword.focus();
-          return;
-        }
-        const data = await response.json();
-        totpQr.src = `data:image/png;base64,${data.qr_code_base64}`;
-        totpSecret.textContent = data.secret;
-        totpConfirmSection.hidden = false;
-        totpConfirmCode.focus();
-      } catch {
-        showError(totpSetupError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  totpConfirmButton.addEventListener("click", async () => {
-    clearError(totpConfirmError);
-    await withLoading(totpConfirmButton, "Confirmando…", async () => {
-      try {
-        const response = await authFetch("/2fa/verify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code: totpConfirmCode.value }),
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(totpConfirmError, extractErrorMessage(data, "No se pudo confirmar el código"));
-          totpConfirmCode.focus();
-          return;
-        }
-        const user = await fetchMe();
-        renderDashboard(user);
-      } catch {
-        showError(totpConfirmError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  togglePremiumBtn.addEventListener("click", async () => {
-    clearError(dashboardError);
-
-    if (currentUser.is_premium) {
-      await withLoading(togglePremiumBtn, "Guardando…", async () => {
-        try {
-          const response = await authFetch("/users/me/premium/deactivate", { method: "POST" });
-          if (!response.ok) {
-            showError(dashboardError, "No se pudo desactivar premium.");
-            return;
-          }
-          const user = await response.json();
-          renderDashboard(user);
-        } catch {
-          showError(dashboardError, NETWORK_ERROR_MESSAGE);
-        }
-      });
-      return;
-    }
-
-    if (!currentUser.totp_enabled) {
-      premiumNeeds2faHint.hidden = false;
-      premiumActivateForm.hidden = true;
-      return;
-    }
-
-    premiumNeeds2faHint.hidden = true;
-    premiumActivateForm.hidden = false;
-    premiumPassword.focus();
-  });
-
-  premiumActivateCancel.addEventListener("click", () => {
-    premiumActivateForm.hidden = true;
-    premiumPassword.value = "";
-    premiumTotpCode.value = "";
-    clearError(premiumActivateError);
-  });
-
-  premiumActivateConfirm.addEventListener("click", async () => {
-    clearError(premiumActivateError);
-    await withLoading(premiumActivateConfirm, "Activando…", async () => {
-      try {
-        const response = await authFetch("/users/me/premium/activate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            password: premiumPassword.value,
-            totp_code: premiumTotpCode.value,
-          }),
-        });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(premiumActivateError, extractErrorMessage(data, "No se pudo activar premium"));
-          premiumTotpCode.focus();
-          return;
-        }
-        const user = await response.json();
-        renderDashboard(user);
-      } catch {
-        showError(premiumActivateError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  logoutBtn.addEventListener("click", async () => {
-    await withLoading(logoutBtn, "Cerrando sesión…", async () => {
-      try {
-        await fetch("/auth/logout", { method: "POST" });
-      } catch {
-        // Best-effort: aunque falle la llamada de red, seguimos cerrando la
-        // sesión en el cliente (el refresh token en el servidor expira solo).
-      }
-      state.accessToken = null;
-      currentUser = null;
-      loginForm.reset();
-      registerForm.reset();
-      resetCatalog();
-      showView("auth");
-    });
-  });
-
-  searchForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const generation = catalogGeneration;
-    clearError(searchError);
-    await withLoading(searchSubmit, "Buscando…", async () => {
-      try {
-        const response = await authFetch(
-          `/songs/search?q=${encodeURIComponent(searchQuery.value)}`
-        );
-        if (generation !== catalogGeneration) return;
-
-        searchResults.textContent = "";
-
-        if (response.status === 401) {
-          showError(searchError, "Tu sesión ha expirado. Vuelve a iniciar sesión.");
-          handleSessionExpired();
-          return;
-        }
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(searchError, extractErrorMessage(data, "No se pudo buscar"));
-          return;
-        }
-
-        const songs = await response.json();
-        if (songs.length === 0) {
-          const li = document.createElement("li");
-          li.textContent = "Sin resultados.";
-          searchResults.appendChild(li);
-          return;
-        }
-        renderSearchResults(songs);
-      } catch {
-        if (generation !== catalogGeneration) return;
-        searchResults.textContent = "";
-        showError(searchError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  searchResults.addEventListener("click", async (event) => {
-    const button = event.target.closest("button[data-song-id]");
-    if (!button) return;
-
-    const generation = catalogGeneration;
-    const requestId = ++playRequestId;
-    const songId = button.dataset.songId;
-    clearError(searchError);
-
-    // withLoading deshabilita el botón mientras su propia petición está en
-    // vuelo (evita que un doble click en LA MISMA canción dispare dos
-    // peticiones y registre el play dos veces en el backend). requestId,
-    // por separado, decide qué respuesta gana cuando se pulsa "Reproducir"
-    // en DOS canciones distintas seguidas: siempre la última pulsada, no la
-    // que responda primero.
-    await withLoading(button, null, async () => {
-      try {
-        const response = await authFetch(`/songs/${songId}/stream`);
-        if (generation !== catalogGeneration || requestId !== playRequestId) return;
-
-        if (response.status === 401) {
-          showError(searchError, "Tu sesión ha expirado. Vuelve a iniciar sesión.");
-          handleSessionExpired();
-          return;
-        }
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          showError(
-            searchError,
-            extractErrorMessage(data, "No se pudo reproducir la canción")
-          );
-          return;
-        }
-
-        const data = await response.json();
-        clearError(searchError);
-        player.src = data.url;
-        player.hidden = false;
-        try {
-          await player.play();
-        } catch {
-          // Reproducción automática bloqueada (política del navegador) u otro
-          // fallo de carga no crítico: el usuario puede darle al play nativo
-          // de los controles del <audio>.
-        }
-      } catch {
-        if (generation !== catalogGeneration || requestId !== playRequestId) return;
-        showError(searchError, NETWORK_ERROR_MESSAGE);
-      }
-    });
-  });
-
-  trySilentRefresh();
-})();
+trySilentRefresh();

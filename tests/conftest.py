@@ -23,6 +23,7 @@ from app.db.session import Base, get_db
 from app.main import app
 from app.models import (  # noqa: F401 - registra los modelos en Base.metadata
     play,
+    playlist,
     song,
     user,
 )
@@ -120,8 +121,8 @@ def _clean_tables() -> Generator[None, None, None]:
     with test_engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE users, refresh_tokens, songs, song_plays "
-                "RESTART IDENTITY CASCADE"
+                "TRUNCATE users, refresh_tokens, songs, song_plays, playlists, "
+                "playlist_songs RESTART IDENTITY CASCADE"
             )
         )
     yield

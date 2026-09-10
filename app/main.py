@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -7,12 +8,22 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.auth import router as auth_router
 from app.api.playback import router as playback_router
+from app.api.playlists import router as playlists_router
 from app.api.songs import router as songs_router
 from app.api.totp import router as totp_router
 from app.api.users import router as users_router
 from app.core.rate_limiter import RateLimitMiddleware
 from app.services.search import ensure_index_exists
 from app.services.storage import ensure_bucket_exists
+
+# Seguro barato para los módulos ES de la Pantalla 3 (app/static/js/**):
+# en el contenedor Docker (Linux) mimetypes.guess_type ya resuelve ".js" a
+# "text/javascript" (verificado empíricamente), que los navegadores aceptan
+# para <script type="module">, pero un registro de MIME distinto en algún
+# host donde se sirviera esta misma imagen rompería silenciosamente todos
+# los imports de módulos - fijarlo explícitamente en vez de confiar en el
+# registro del SO subyacente.
+mimetypes.add_type("text/javascript", ".js")
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +75,7 @@ app.include_router(users_router)
 app.include_router(totp_router)
 app.include_router(songs_router)
 app.include_router(playback_router)
+app.include_router(playlists_router)
 
 
 @app.get("/health")

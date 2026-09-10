@@ -1,0 +1,426 @@
+/* :not([hidden]) es imprescindible aquí, no cosmético: un selector de ID
+   como "#app-view { display: flex }" tiene más peso en la cascada que la
+   regla del user-agent "[hidden] { display: none }" (los estilos de autor
+   ganan a los del UA independientemente de especificidad) - sin este guard,
+   #app-view seguiría ocupando layout y capturando clicks aunque showView()
+   le pusiera el atributo hidden (encontrado empíricamente en la
+   verificación en navegador: #show-register quedaba bloqueado por el modal
+   de #app-view incluso con la vista "oculta"). */
+#app-view:not([hidden]) {
+  max-width: none;
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
+  padding: 1rem;
+  position: relative;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Blobs de fondo: gradientes radiales difuminados, sensación de profundidad
+   detrás del cristal. pointer-events: none - nunca deben interceptar clics. */
+.blob {
+  position: fixed;
+  z-index: -1;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+.blob-1 {
+  width: 30rem;
+  height: 30rem;
+  top: -10rem;
+  left: -8rem;
+  background: radial-gradient(circle, var(--accent-2), transparent 70%);
+}
+
+.blob-2 {
+  width: 26rem;
+  height: 26rem;
+  bottom: -8rem;
+  right: -6rem;
+  background: radial-gradient(circle, var(--accent-3), transparent 70%);
+}
+
+.blob-3 {
+  width: 20rem;
+  height: 20rem;
+  top: 40%;
+  left: 60%;
+  background: radial-gradient(circle, var(--accent), transparent 70%);
+}
+
+.glass-panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-soft);
+}
+
+#topbar {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.25rem;
+  flex-wrap: wrap;
+}
+
+#topbar-brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  background: linear-gradient(135deg, var(--accent), var(--accent-3));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+#topbar-playlists {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+#topbar-playlists button {
+  margin-top: 0;
+}
+
+#playlist-selector {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  color: var(--text-primary);
+  border-radius: var(--radius-md);
+  padding: 0.4rem 0.6rem;
+}
+
+#topbar-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+#main-panels {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  flex: 1;
+  min-height: 0;
+}
+
+#discovery-panel,
+#playlist-panel {
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  transition: box-shadow var(--transition-fast), border-color var(--transition-fast);
+}
+
+#discovery-panel h2,
+#playlist-panel h2 {
+  margin: 0 0 0.75rem;
+  font-weight: 600;
+}
+
+/* :not([hidden]) en #playlist-songs es obligatorio, no cosmético - se oculta
+   vía JS cuando la playlist está vacía (mismo motivo que #app-view arriba).
+   #discovery-list nunca se oculta como conjunto, pero se guarda la misma
+   regla por consistencia/seguridad ante cambios futuros. */
+#discovery-list:not([hidden]),
+#playlist-songs:not([hidden]) {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#playlist-panel.drop-target-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent), var(--shadow-soft);
+}
+
+.song-card,
+.playlist-song-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.03);
+  transition: background var(--transition-fast), transform var(--transition-fast),
+    box-shadow var(--transition-fast), opacity var(--transition-fast);
+  animation: fadeInUp 220ms ease;
+}
+
+.song-card:hover,
+.playlist-song-row:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.song-card.dragging,
+.playlist-song-row.dragging {
+  opacity: 0.5;
+  transform: scale(0.98) translateY(-2px);
+  box-shadow: var(--shadow-soft);
+}
+
+.playlist-song-row.drop-before {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.playlist-song-row.drop-after {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.song-card.now-playing,
+.playlist-song-row.now-playing {
+  background: rgba(45, 212, 191, 0.12);
+}
+
+.song-card.now-playing::before,
+.playlist-song-row.now-playing::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.cover-art {
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+
+.song-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.song-info.clickable {
+  cursor: pointer;
+}
+
+.song-title,
+.song-artist {
+  margin: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.song-title {
+  font-weight: 500;
+}
+
+.song-duration {
+  flex-shrink: 0;
+}
+
+.play-hover-button {
+  margin: 0;
+  padding: 0.3rem 0.55rem;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.song-card:hover .play-hover-button,
+.song-card:focus-within .play-hover-button {
+  opacity: 1;
+}
+
+.add-button,
+.move-button,
+.remove-button {
+  margin: 0;
+  padding: 0.3rem 0.55rem;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+.add-button:hover:not(:disabled),
+.move-button:hover:not(:disabled),
+.remove-button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.playlist-song-row.shake {
+  animation: shake 400ms ease;
+}
+
+/* :not([hidden]) obligatorio - ver comentario de #app-view más arriba, mismo
+   motivo exacto (JS alterna el atributo hidden entre esto y #playlist-songs
+   según haya o no canciones). */
+#playlist-empty-state:not([hidden]) {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+/* :not([hidden]) obligatorio - player.js oculta la barra hasta que hay una
+   canción cargada (mismo motivo que #app-view/#playlist-empty-state). */
+#player-bar:not([hidden]) {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.6rem 1.25rem;
+  position: sticky;
+  bottom: 0;
+}
+
+#player-track-info {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 10rem;
+}
+
+#player-track-info p {
+  margin: 0;
+}
+
+#player-song-title {
+  font-weight: 500;
+}
+
+#player-controls {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+#player-controls button {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+#player-play-pause {
+  background: var(--accent);
+  color: #04231f;
+}
+
+#player-progress {
+  flex: 1;
+}
+
+#player-volume-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+input[type="range"] {
+  accent-color: var(--accent);
+}
+
+/* :not([hidden]) obligatorio - mismo motivo que #app-view más arriba. */
+.modal-backdrop:not([hidden]) {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.modal {
+  padding: 1.5rem;
+  width: min(24rem, 90vw);
+}
+
+.modal h2 {
+  margin-top: 0;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(1.4);
+  }
+}
+
+@keyframes shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20%,
+  60% {
+    transform: translateX(-4px);
+  }
+  40%,
+  80% {
+    transform: translateX(4px);
+  }
+}
+
+@media (max-width: 900px) {
+  #main-panels {
+    grid-template-columns: 1fr;
+  }
+
+  #discovery-panel,
+  #playlist-panel {
+    max-height: 45vh;
+  }
+}
+
+@media (max-width: 600px) {
+  #player-bar {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  #player-track-info {
+    min-width: 0;
+  }
+
+  #player-song-artist {
+    display: none;
+  }
+
+  #player-volume-wrap {
+    display: none;
+  }
+}

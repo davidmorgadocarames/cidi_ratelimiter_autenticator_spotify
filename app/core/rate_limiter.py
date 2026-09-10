@@ -105,7 +105,7 @@ _IP_ONLY_ENDPOINTS = {
 # /songs (la colección) son exactamente ese path, y "/songs".startswith(
 # "/songs/") sería False, dejando la colección sin límite (encontrado por el
 # abogado del diablo en la revisión de esta fase, antes de implementar).
-_RATE_LIMITED_PREFIXES = ("/auth/", "/users/", "/2fa/", "/songs")
+_RATE_LIMITED_PREFIXES = ("/auth/", "/users/", "/2fa/", "/songs", "/playlists")
 
 
 def _resolve_tier(method: str, path: str) -> Tier | None:
