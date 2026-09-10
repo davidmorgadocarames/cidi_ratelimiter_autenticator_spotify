@@ -39,6 +39,9 @@
   const showRegisterBtn = document.getElementById("show-register");
   const showLoginBtn = document.getElementById("show-login");
 
+  const resendVerificationBtn = document.getElementById("resend-verification");
+  const resendVerificationHint = document.getElementById("resend-verification-hint");
+
   const dashboardEmail = document.getElementById("dashboard-email");
 
   const totpStatus = document.getElementById("totp-status");
@@ -274,23 +277,23 @@
           return;
         }
 
-        // Auto-login con las mismas credenciales tras un registro exitoso.
-        const loginBody = new URLSearchParams();
-        loginBody.set("username", registerEmail.value);
-        loginBody.set("password", registerPassword.value);
-        const loginResponse = await fetch("/auth/login", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: loginBody,
-        });
-        if (!loginResponse.ok) {
-          showError(registerError, "Cuenta creada. Inicia sesión manualmente.");
-          return;
-        }
-        const data = await loginResponse.json();
-        state.accessToken = data.access_token;
-        const user = await fetchMe();
-        renderDashboard(user);
+        // Ya NO se intenta un auto-login: la cuenta nace con email_verified=false
+        // (ver app/api/auth.py::register), así que un POST /auth/login aquí
+        // fallaría con 403 el 100% de las veces por construcción - además de
+        // ser una llamada desperdiciada, consumía un token del bucket
+        // "sensitive" de login (capacidad 5) sin ningún beneficio, dejando
+        // menos margen al usuario para reintentos reales (hallazgo de la
+        // revisión "abogado del diablo" sobre la implementación). En su lugar,
+        // se cambia directo a la vista de login con email Y contraseña
+        // precargados y un aviso de que debe verificar su correo.
+        loginEmail.value = registerEmail.value;
+        loginPassword.value = registerPassword.value;
+        registerSection.hidden = true;
+        loginSection.hidden = false;
+        showError(
+          loginError,
+          "Cuenta creada. Revisa tu correo para verificar tu email antes de iniciar sesión."
+        );
       } catch {
         showError(registerError, NETWORK_ERROR_MESSAGE);
       }
@@ -311,6 +314,38 @@
     registerSection.hidden = true;
     loginSection.hidden = false;
     loginEmail.focus();
+  });
+
+  resendVerificationBtn.addEventListener("click", async () => {
+    // Solo una de las dos secciones (#login-section / #register-section) está
+    // visible a la vez - mirar el atributo "hidden" es la regla sin ambigüedad
+    // para decidir de cuál tomar el email (mismo criterio que ya usa
+    // showView() para las vistas de nivel superior).
+    const email = loginSection.hidden ? registerEmail.value : loginEmail.value;
+    resendVerificationHint.hidden = true;
+    if (!email) {
+      resendVerificationHint.textContent = "Escribe tu email arriba primero.";
+      resendVerificationHint.hidden = false;
+      return;
+    }
+    await withLoading(resendVerificationBtn, "Enviando…", async () => {
+      try {
+        const response = await fetch("/auth/resend-verification", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email }),
+        });
+        const data = await response.json().catch(() => ({}));
+        resendVerificationHint.textContent = extractErrorMessage(
+          data,
+          "No se pudo reenviar el email."
+        );
+        resendVerificationHint.hidden = false;
+      } catch {
+        resendVerificationHint.textContent = NETWORK_ERROR_MESSAGE;
+        resendVerificationHint.hidden = false;
+      }
+    });
   });
 
   totpSetupButton.addEventListener("click", async () => {

@@ -1340,6 +1340,70 @@ Verificado empíricamente de extremo a extremo contra el dataset real (columnas
 reinicio del `catalog_server` sin conflicto de puerto, reproducción funcionando vía
 `GET /songs/{id}/stream`).
 
+## Verificación de email en el registro (Mailhog)
+
+`POST /auth/register` genera un token de verificación (mismo patrón que los refresh
+tokens: `secrets.token_urlsafe(32)`, se guarda solo el hash sha256, nunca el token en
+claro) y envía un correo real con el enlace de verificación - `POST /auth/login`
+rechaza con 403 hasta que ese enlace se visite (`GET /auth/verify-email?token=...`).
+
+**Mailhog, no SMTP real hacia una cuenta de verdad** (nuevo servicio en
+`docker-compose.yml`, `mailhog/mailhog:v1.0.1`): captura el correo en memoria y lo
+expone por su propia API/UI web en `http://localhost:8025`, sin credenciales de
+terceros que gestionar ni límite de envíos que agotar - mismo espíritu que MinIO para
+S3 o el propio Postgres para producción ("infraestructura real, verificada
+empíricamente", nunca mocks). Verificado empíricamente que la imagen trae `wget` pero
+NO `curl` (a diferencia de MinIO/Meilisearch) - el healthcheck de `docker-compose.yml`
+y el `--health-cmd` del job `test` de `ci.yml` usan `wget`. A diferencia de MinIO,
+la imagen no necesita ningún argumento de comando (arranca con su `ENTRYPOINT` por
+defecto), así que en `ci.yml` sí puede declararse en el bloque `services:` normal
+(igual que Postgres/Redis/Meilisearch), sin el "docker run" manual que MinIO necesita.
+
+`app/services/email.py::send_verification_email` es best-effort y nunca propaga - mismo
+patrón que `search.index_song` (Fase 10): si Mailhog está caído, tanto `register()` como
+`resend-verification()` siguen respondiendo con éxito (201/200) sin ningún aviso al
+cliente de que el correo no llegó. Riesgo aceptado y consistente con el resto del
+proyecto, no una laguna nueva de esta pieza - la única señal es el log del contenedor
+`app`. `smtplib.SMTP(..., timeout=5)` explícito: sin él, un Mailhog inalcanzable por un
+fallo de red silencioso podría colgar el hilo del request indefinidamente.
+
+**`email_verified` con `default=False` (Python) pero `server_default="true"` (DB) -
+deliberadamente distintos, no un error de copia.** El `default` de Python aplica a cada
+`User(...)` nuevo creado por `register()` - las cuentas NUEVAS nacen sin verificar. El
+`server_default="true"` es la política de backfill que la propia migración aplica a las
+filas YA EXISTENTES: sin esto, aplicar la migración habría dejado de la noche a la
+mañana bloqueadas de login todas las cuentas de prueba creadas en fases anteriores, por
+una verificación que nunca se les pidió hacer.
+
+**`resend-verification` no toca la DB en el handler síncrono en absoluto - TODO el
+trabajo con efecto (lookup, generar token, commit, envío SMTP) vive dentro de la
+`BackgroundTasks`** (`app/api/auth.py::_process_resend_verification`), no solo el envío
+de email. Primer diseño (corregido tras la segunda ronda de revisión de seguridad,
+sobre la implementación ya escrita): el lookup + `db.commit()` del token nuevo vivían
+en el handler síncrono, y solo el envío SMTP se difería - pero un `db.commit()` a
+Postgres es medible por timing, así que la rama real (cuenta existe y no verificada)
+seguía tardando sistemáticamente más que las otras dos (cuenta inexistente / ya
+verificada) pese a que el CUERPO de la respuesta ya era idéntico en las tres. Con el
+lookup también dentro de la tarea en background, el handler no hace ningún trabajo
+condicional - las tres ramas son indistinguibles por timing, no solo por cuerpo. La
+tarea abre su propia sesión vía `SessionLocal` (no `Depends(get_db)`, que ya se cerró
+para cuando la tarea corre) - mismo patrón que los scripts de `app/cli/`, incluida la
+misma necesidad de monkeypatchear `SessionLocal` en los tests que ejercitan este
+endpoint (ver `tests/test_email_verification.py`, `test_session_factory`). `register()`
+no necesita este tratamiento: es un único código de negocio sin ramas que distinguir
+por timing (la señal de enumeración ahí ya es el 409 explícito de email duplicado,
+riesgo preexistente documentado más abajo, no algo que esta pieza empeore).
+
+**Rate limiting: `resend-verification`/`verify-email` se quedan en el tier `GENERAL`,
+deliberadamente NO en `SENSITIVE`** (el de login/registro). El bucket del rate limiter
+es por tier + identidad, no por endpoint (`app/core/rate_limiter.py`) - si
+`resend-verification` compartiera el tier `SENSITIVE` (capacidad 5) con login/registro,
+el flujo típico de esta misma pieza (registro + un par de reintentos de login antes de
+verificar) agotaría el bucket antes de que el usuario llegara a pulsar "Reenviar",
+devolviendo 429 en la propia vía de escape que la pieza construye.
+
+Para inspeccionar correos capturados en desarrollo: `http://localhost:8025`.
+
 ## Riesgos conocidos
 
 - ~~Desalineación de versión de Python~~ — **verificado en Fase 5, sin problemas reales**: el
@@ -1359,6 +1423,26 @@ reinicio del `catalog_server` sin conflicto de puerto, reproducción funcionando
   existe), a diferencia de `/auth/login` que sí es cuidadoso (401 genérico + timing equalizado
   tanto si el email no existe como si la contraseña es incorrecta). Aceptado como limitación
   conocida para este proyecto de portfolio, no corregido en Fase 1.
+- **Fallo de envío de email de verificación completamente silencioso hacia el cliente
+  HTTP** (ver "Verificación de email en el registro" arriba): si Mailhog no está
+  levantado, `register()`/`resend-verification()` siguen respondiendo con éxito sin
+  avisar que el correo no llegó - mismo patrón ya aceptado para `search.index_song`
+  (Fase 10), consistente con el resto del proyecto.
+- **`GET /auth/verify-email` muta estado con un método GET, vulnerable a
+  link-scanning/prefetch** (hallazgo de la revisión "abogado del diablo" sobre la
+  implementación): gestores de correo corporativos y proxies antivirus a veces
+  pre-visitan los enlaces de un email por seguridad, antes de que el usuario haga
+  clic. Aquí eso no crea una vulnerabilidad (el escaneo simplemente adelanta la
+  verificación al estado que de todos modos se quiere), pero SÍ quema el token: el
+  clic real del usuario, después, encuentra `token_hash` ya en `NULL` y ve la página
+  de error aunque su cuenta ya esté verificada y pueda hacer login con normalidad. El
+  mensaje de error menciona esta posibilidad explícitamente para no confundir, pero no
+  se ha cambiado el endpoint a POST (aceptado para el alcance de un portfolio).
+- **Cuentas "zombie": un registro nunca verificado bloquea ese email para siempre**
+  (mismo hallazgo de revisión): `register()` sigue devolviendo 409 en un email ya
+  usado aunque esa cuenta jamás llegue a verificarse, y no hay TTL ni limpieza
+  automática de cuentas sin verificar. La única salida es "Reenviar" + visitar el
+  enlace. Aceptado para el alcance de un portfolio, no corregido en esta pieza.
 - **`COOKIE_SECURE=true` por defecto requiere HTTPS**: en desarrollo local por `http://` hay que
   poner `COOKIE_SECURE=false` en `.env` (así está configurado en el `.env` local), o el navegador
   no enviará la cookie del refresh token.

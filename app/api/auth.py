@@ -2,7 +2,16 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import jwt
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Cookie,
+    Depends,
+    HTTPException,
+    Response,
+    status,
+)
+from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -13,14 +22,23 @@ from app.core.config import settings
 from app.core.security import (
     create_access_token,
     decode_access_token,
+    generate_email_verification_token,
     generate_refresh_token,
+    hash_email_verification_token,
     hash_password,
     hash_refresh_token,
     verify_password,
 )
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.models.user import RefreshToken, User
-from app.schemas.user import Token, TokenPayload, UserCreate, UserRead
+from app.schemas.user import (
+    ResendVerificationRequest,
+    Token,
+    TokenPayload,
+    UserCreate,
+    UserRead,
+)
+from app.services.email import send_verification_email
 
 # Hash bcrypt "dummy" contra el que se compara cuando el usuario no existe, para que
 # /auth/login tarde lo mismo con email inexistente que con password incorrecta y no
@@ -63,6 +81,18 @@ def _create_refresh_token_record(
     return record, raw_token
 
 
+def _set_new_verification_token(user: User) -> str:
+    """Genera un token nuevo y lo guarda (hasheado) en el usuario, invalidando
+    cualquier token de verificación anterior - no persiste por sí sola, quien
+    llama debe hacer commit."""
+    raw_token = generate_email_verification_token()
+    user.email_verification_token_hash = hash_email_verification_token(raw_token)
+    user.email_verification_token_expires_at = datetime.now(timezone.utc) + timedelta(
+        hours=settings.email_verification_token_expire_hours
+    )
+    return raw_token
+
+
 def get_current_user(
     token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
 ) -> User:
@@ -99,6 +129,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
         )
 
     user = User(email=payload.email, hashed_password=hash_password(payload.password))
+    raw_token = _set_new_verification_token(user)
     db.add(user)
     try:
         db.commit()
@@ -108,6 +139,13 @@ def register(payload: UserCreate, db: Session = Depends(get_db)) -> User:
             status_code=status.HTTP_409_CONFLICT, detail="Email ya registrado"
         ) from None
     db.refresh(user)
+
+    # Síncrono a propósito (no BackgroundTasks): register() es un único código
+    # de negocio sin ramas que distinguir por timing - a diferencia de
+    # resend-verification (más abajo), aquí no hay nada que un atacante pueda
+    # enumerar comparando latencias.
+    send_verification_email(user.email, raw_token)
+
     return user
 
 
@@ -137,6 +175,11 @@ def login(
     if not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Usuario inactivo"
+        )
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verifica tu email antes de iniciar sesión",
         )
 
     family_id = str(uuid.uuid4())
@@ -227,3 +270,79 @@ def logout(
 @router.get("/me", response_model=UserRead)
 def read_current_user(current_user: User = Depends(get_current_user)) -> User:
     return current_user
+
+
+_VERIFY_SUCCESS_HTML = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Email verificado</title></head>
+<body><p>Tu email ha sido verificado. Ya puedes <a href="/">iniciar sesión</a>.</p>
+</body></html>"""
+
+_VERIFY_ERROR_HTML = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><title>Enlace inválido</title></head>
+<body><p>Este enlace de verificación no es válido o ha caducado - o puede que tu email
+ya esté verificado (algunos gestores de correo/antivirus abren los enlaces de forma
+automática por seguridad, antes de que llegues a hacer clic tú mismo). Prueba a
+<a href="/">iniciar sesión</a> directamente; si no funciona, pide un enlace nuevo desde
+ahí.</p></body></html>"""
+
+
+@router.get("/verify-email", response_class=HTMLResponse)
+def verify_email(token: str, db: Session = Depends(get_db)) -> HTMLResponse:
+    token_hash = hash_email_verification_token(token)
+    user = db.scalar(
+        select(User).where(User.email_verification_token_hash == token_hash)
+    )
+    if user is None or (
+        user.email_verification_token_expires_at is not None
+        and user.email_verification_token_expires_at < datetime.now(timezone.utc)
+    ):
+        return HTMLResponse(content=_VERIFY_ERROR_HTML, status_code=400)
+
+    user.email_verified = True
+    user.email_verification_token_hash = None
+    user.email_verification_token_expires_at = None
+    db.commit()
+
+    return HTMLResponse(content=_VERIFY_SUCCESS_HTML)
+
+
+def _process_resend_verification(email: str) -> None:
+    """Corre en BackgroundTasks, después de que la respuesta HTTP ya se envió
+    al cliente - TODO el trabajo con efecto (lookup, generar token, commit,
+    envío SMTP) vive aquí, no en el handler síncrono de abajo. Hallazgo real
+    de la revisión de seguridad post-implementación: con el lookup + commit
+    en el handler síncrono, solo la rama "cuenta existe y no verificada"
+    hacía un db.commit() antes de devolver la respuesta - un commit síncrono
+    a Postgres es medible por timing, así que esa rama sí se podía distinguir
+    de las otras dos (cuenta inexistente / ya verificada) pese a que el
+    CUERPO de la respuesta ya era idéntico en las tres. Con el lookup también
+    dentro de la tarea en background, el handler no toca la DB en absoluto -
+    las tres ramas son ahora indistinguibles por timing, no solo por cuerpo.
+    Abre su propia sesión (SessionLocal, no Depends(get_db)): la sesión de la
+    request ya se cerró para cuando esta tarea corre."""
+    db = SessionLocal()
+    try:
+        user = db.scalar(select(User).where(User.email == email))
+        if user is not None and not user.email_verified:
+            raw_token = _set_new_verification_token(user)
+            db.commit()
+            send_verification_email(user.email, raw_token)
+    finally:
+        db.close()
+
+
+@router.post("/resend-verification", status_code=status.HTTP_200_OK)
+def resend_verification(
+    payload: ResendVerificationRequest,
+    background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    # Respuesta genérica SIEMPRE la misma, exista o no la cuenta, esté o no ya
+    # verificada (mismo principio anti-enumeración que login() con el hash
+    # "dummy"). El handler no toca la DB en absoluto (ver
+    # _process_resend_verification) - agenda el trabajo real incondicional y
+    # devuelve de inmediato, así las tres ramas son indistinguibles también
+    # por timing, no solo por cuerpo.
+    background_tasks.add_task(_process_resend_verification, payload.email)
+    return {
+        "detail": "Si la cuenta existe y no está verificada, se ha enviado un email."
+    }

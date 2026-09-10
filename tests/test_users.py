@@ -1,4 +1,5 @@
 import pyotp
+from conftest import mark_email_verified
 from fastapi.testclient import TestClient
 
 PASSWORD = "supersecret"
@@ -8,6 +9,7 @@ def _register_and_login(
     client: TestClient, email: str = "premium@example.com", password: str = PASSWORD
 ) -> str:
     client.post("/auth/register", json={"email": email, "password": password})
+    mark_email_verified(email)
     login_response = client.post(
         "/auth/login", data={"username": email, "password": password}
     )
